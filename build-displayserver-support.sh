@@ -216,6 +216,7 @@ elf_checks() {
             fail "${f#"$dir"} has an RPATH/RUNPATH naming a build-host path, /usr/local or $X_PREFIX"
         fi
         if grep -q -a -F "$SYSROOT" "$f"; then
+            grep -a -o "$SYSROOT[[:graph:]]*" "$f" | sort -u | sed 's/^/    | /' >&2
             fail "${f#"$dir"} has the build sysroot ($SYSROOT) compiled in"
         fi
         n=$((n + 1))
@@ -457,7 +458,8 @@ host_gperf() {
 }
 
 # =============================================================================
-# Components, in build order (E25 audit 1, section 4.2): graphics and fonts,
+# Components, in build order (E25 audit 1, section 4.2, with libxkbcommon
+# before xkeyboard-config; see build_libxkbcommon): graphics and fonts,
 # keyboard, then the input stack.
 # =============================================================================
 
@@ -674,12 +676,15 @@ build_xkeyboard_config() {
 # built from this same tarball (E25 D5), so -Denable-x11=false here. Paths:
 #   xkb root         /usr/share/X11/xkb (xkeyboard-config above)
 #   extra path       /etc/xkb (local additions; nextbsd-overlays#26)
-#   extensions       /usr/share/xkeyboard-config-2.d and
-#                    /usr/share/xkeyboard-config.d, upstream's defaults for
-#                    this xkeyboard-config, given explicitly so they never
-#                    depend on what the sysroot's xkeyboard-config.pc says
 #   X locale root    /usr/X11/share/X11/locale, the Compose tables libX11
 #                    installs (nextbsd-xlibs)
+# It builds BEFORE xkeyboard-config, as it did in nextbsd-xlibs, where no
+# xkeyboard-config.pc was in the sysroot: when meson finds that .pc it takes
+# the legacy root (DFLT_XKB_LEGACY_ROOT, which has no option) from pkgconf,
+# and pkgconf prefixes it with the build sysroot. Without it the legacy root
+# is upstream's $datadir/X11/xkb, /usr/share/X11/xkb, and the xkeyboard-config
+# extension paths stay unset, as before the move. elf_checks refuses the
+# library if the sysroot is ever compiled in.
 # No tools, Wayland (E25 D2), xkbregistry (it needs libxml2), docs or bash
 # completion.
 build_libxkbcommon() {
@@ -690,8 +695,6 @@ build_libxkbcommon() {
         -Denable-docs=false -Denable-bash-completion=false -Denable-x11=false \
         -Dxkb-config-root="$PREFIX/share/X11/xkb" \
         -Dxkb-config-extra-path="$SYSCONFDIR/xkb" \
-        -Dxkb-config-versioned-extensions-path="$PREFIX/share/xkeyboard-config-2.d" \
-        -Dxkb-config-unversioned-extensions-path="$PREFIX/share/xkeyboard-config.d" \
         -Dx-locale-root="$X_PREFIX/share/X11/locale"
     stage libxkbcommon
     local x="$DESTDIR$PREFIX"
@@ -989,8 +992,8 @@ COMPONENTS="
     expat
     freetype
     fontconfig
-    xkeyboard-config
     libxkbcommon
+    xkeyboard-config
     epoll-shim
     libudev-devd
     linux-input-shim

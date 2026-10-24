@@ -142,7 +142,7 @@ build.
 | libdrm data | `/usr/share/libdrm/amdgpu.ids` (amd64) |
 | fontconfig | config `/etc/fonts` (not in the artifact, see [fontconfig](#fontconfig)), templates `/usr/share/fontconfig/conf.avail`, DTD `/usr/share/xml/fontconfig`, cache `/var/cache/fontconfig` |
 | xkb data | `/usr/share/xkeyboard-config-2`, with `/usr/share/X11/xkb` → `../xkeyboard-config-2` |
-| libxkbcommon | xkb root `/usr/share/X11/xkb`, extra path `/etc/xkb`, extensions `/usr/share/xkeyboard-config-2.d` and `/usr/share/xkeyboard-config.d`, X locale (Compose) root `/usr/X11/share/X11/locale` (libX11's, from nextbsd-xlibs) |
+| libxkbcommon | xkb root (and legacy root) `/usr/share/X11/xkb`, extra path `/etc/xkb`, X locale (Compose) root `/usr/X11/share/X11/locale` (libX11's, from nextbsd-xlibs) |
 | libinput | quirks `/usr/share/libinput`, local overrides `/etc/libinput/local-overrides.quirks`; no udev rules |
 | `<linux/input.h>` shim | `/usr/include/linux-input-shim/linux/`, through `linux-input-shim.pc` (see [linux-input-shim](#linux-input-shim)) |
 
@@ -153,7 +153,10 @@ in.
 
 ## Components
 
-In build order (E25 audit 1, section 4.2).
+In build order (E25 audit 1, section 4.2, except that libxkbcommon builds
+before xkeyboard-config, as it did in nextbsd-xlibs: if meson finds
+`xkeyboard-config.pc`, libxkbcommon takes its legacy xkb root from pkgconf with
+the build sysroot prefixed, and that root has no option to override it).
 
 | Component | Version | Build | Installs | Was in |
 |---|---|---|---|---|
@@ -162,8 +165,8 @@ In build order (E25 audit 1, section 4.2).
 | `expat` | 2.9.0 | autotools | public `libexpat.so.1`, `expat.h`. The base's private `libbsdxml` is untouched; the base has no `libexpat` or `expat.h` | nextbsd-xlibs |
 | `freetype` | 2.15.0 | meson | `libfreetype.so.6` (base zlib and bzip2; no libpng, harfbuzz or brotli) | nextbsd-xlibs |
 | `fontconfig` | 2.18.3 | meson (+ host gperf) | `libfontconfig.so.1`, the ten `fc-*` tools | nextbsd-xlibs |
-| `xkeyboard-config` | 2.48 | meson | the XKB keymap data | nextbsd-xlibre |
 | `libxkbcommon` | 1.13.2 | meson | `libxkbcommon.so.0`, core only (`-Denable-x11=false`; `libxkbcommon-x11` stays in nextbsd-xlibs, E25 D5) | nextbsd-xlibs |
+| `xkeyboard-config` | 2.48 | meson | the XKB keymap data | nextbsd-xlibre |
 | `epoll-shim` | 0.0.20240608 | CMake | `libepoll-shim.so.0`, `libepoll-shim-interpose.so.0`, headers in `libepoll-shim/` | nextbsd-xlibre |
 | `libudev-devd` | 0.7.0 | meson | `libudev.so.0`, `libudev.h` (unmodified; replaced later by the IOKit libudev with the same soname, E25 D7) | nextbsd-xlibre |
 | `linux-input-shim` | NextBSD | headers | `<linux/input.h>`, `<linux/input-event-codes.h>`, `<linux/uinput.h>`, `linux-input-shim.pc` | nextbsd-xlibre |
