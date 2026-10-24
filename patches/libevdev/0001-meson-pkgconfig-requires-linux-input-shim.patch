@@ -1,0 +1,21 @@
+Description: libevdev.pc requires linux-input-shim
+ The installed libevdev/libevdev.h and libevdev/libevdev-uinput.h include
+ <linux/input.h> and <linux/uinput.h>. NextBSD has no /usr/include/linux:
+ nextbsd-displayserver-support's linux-input-shim installs those two headers
+ (each an #include of the base kernel's <dev/evdev/...> header) in
+ /usr/include/linux-input-shim and adds that directory through its own
+ linux-input-shim.pc. Requiring it here makes `pkgconf --cflags libevdev`
+ enough to compile against the installed headers. libevdev's own build uses
+ the copy in its include/linux/freebsd and is unchanged.
+Origin: NextBSD (nextbsd/nextbsd-displayserver-support#1, E25)
+Forwarded: not-needed
+--- a/meson.build
++++ b/meson.build
+@@ -91,6 +91,7 @@
+ 	version: meson.project_version(),
+ 	libraries: lib_libevdev,
+ 	subdirs: 'libevdev-1.0',
++	requires: 'linux-input-shim',
+ )
+ 
+ man_config = configuration_data()

@@ -1,0 +1,4 @@
+# mtdev 1.1.7 (sources.lock). Applied in order by build-displayserver-support.sh.
+#
+# NextBSD: the .pc pulls in the <linux/input.h> shim (README, "linux-input-shim").
+0001-mtdev.pc-requires-linux-input-shim.patch

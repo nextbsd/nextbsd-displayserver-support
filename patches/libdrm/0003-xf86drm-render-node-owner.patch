@@ -1,0 +1,287 @@
+Description: Give a render node to the DRM device that owns it
+ On FreeBSD-based kernels libdrm finds a node's device (hw.dri.<N>) by taking
+ a render node's minor minus 128 as N. drm-kmod's drm_dev_init() allocates
+ render minors (from 128) and primary minors (from 0) as two separate
+ sequences, and only for drivers with DRIVER_RENDER, so a display-only device
+ shifts them apart. On the Raspberry Pi 5 card0 is vc4 (display only), card1
+ is v3d and renderD128 is v3d's, but libdrm gave renderD128 to hw.dri.0, vc4:
+ drmGetDevices2() grouped it with card0, and v3d had no render node. It was
+ masked only because the Pi 5 has one render node and Mesa's renderonly path
+ opens it by name; the same happens with bochs or vboxvideo beside a GPU.
+ .
+ The node's device is now looked up instead:
+  - a primary node is the hw.dri.<N> whose "name" sysctl names that device
+    node ("<driver> 0x<udev of the primary node>");
+  - with one DRM device, every render node is its;
+  - otherwise the render node's driver is read with DRM_IOCTL_VERSION (allowed
+    on render nodes). DRIVER_RENDER is per driver, and each device gets its
+    render and primary minors together, so among that driver's devices the
+    k-th render node belongs to the device with the k-th lowest primary minor.
+ get_sysctl_pci_bus_info() (upstream's PCI path, which had the same
+ "id -= 128" and BUG comment) now uses the same lookup through
+ get_sysctl_busid().
+Origin: NextBSD (nextbsd/nextbsd-xlibs#2; the defect is in E23 audit 1,
+ section 6, and nextbsd-kernel-extensions#66)
+Forwarded: no
+---
+diff --git a/xf86drm.c b/xf86drm.c
+index 30c743f..f4044af 100644
+--- a/xf86drm.c
++++ b/xf86drm.c
+@@ -3620,46 +3620,180 @@ static int get_subsystem_type(const char *device_path)
+ 
+ #ifdef __FreeBSD__
+ /*
+- * Read hw.dri.<N>.busid for the DRM node (maj, min) into busid.
+- *
+- * Factored out of get_sysctl_pci_bus_info() so the bus string can be examined
+- * before it is parsed: on an SoC (platform) device it reads
+- * "platform:<driver>.<unit>" rather than "pci:<domain>:<bus>:<dev>.<func>".
++ * drm-kmod gives every DRM device one hw.dri.<N> sysctl node, N = 0..9 in
++ * registration order (drm_sysctl_freebsd.c), whatever nodes it has.
+  */
+-static int get_sysctl_busid(int maj, int min, char *busid, size_t busid_len)
++#define DRM_SYSCTL_MAX_DEVICES 10
++
++/*
++ * Read hw.dri.<idx>.name, which drm-kmod formats as
++ * "<driver> 0x<udev of the primary node>[ <unique>]", into the driver name and
++ * the primary node's minor (the N of /dev/drm/N).
++ */
++static int get_sysctl_dri_name(int idx, char *driver, size_t driver_len,
++                               int *primary)
+ {
+-    char dname[SPECNAMELEN];
+     char sysctl_name[32];
+-    size_t sysctl_len;
+-    int id, type;
+-    unsigned int rdev;
++    char val[256];
++    char dname[SPECNAMELEN];
++    size_t len = sizeof(val) - 1;
++    uintmax_t udev;
++    char *sep;
++
++    if (snprintf(sysctl_name, sizeof(sysctl_name), "hw.dri.%d.name", idx) <= 0)
++        return -EINVAL;
++    if (sysctlbyname(sysctl_name, val, &len, NULL, 0))
++        return -errno;
++    val[len] = '\0';
+ 
+-    rdev = makedev(maj, min);
+-    if (!devname_r(rdev, S_IFCHR, dname, sizeof(dname)))
++    sep = strchr(val, ' ');
++    if (!sep || sep == val || (size_t)(sep - val) >= driver_len)
++        return -EINVAL;
++    *sep = '\0';
++    if (sscanf(sep + 1, "0x%jx", &udev) != 1)
+         return -EINVAL;
++    if (!devname_r((dev_t)udev, S_IFCHR, dname, sizeof(dname)))
++        return -EINVAL;
++    if (sscanf(dname, "drm/%d", primary) != 1)
++        return -EINVAL;
++
++    memcpy(driver, val, sep - val + 1);
++    return 0;
++}
++
++/* The driver name of /dev/drm/<id>, from DRM_IOCTL_VERSION on the node. */
++static int get_drm_node_driver(int id, char *driver, size_t driver_len)
++{
++    struct drm_version version;
++    char path[64];
++    int fd, ret = 0;
++
++    snprintf(path, sizeof(path), "/dev/drm/%d", id);
++    fd = open(path, O_RDWR | O_CLOEXEC);
++    if (fd < 0)
++        return -errno;
+ 
+-    if (sscanf(dname, "drm/%d\n", &id) != 1)
++    memclear(version);
++    version.name = driver;
++    version.name_len = driver_len - 1;
++    if (drmIoctl(fd, DRM_IOCTL_VERSION, &version))
++        ret = -errno;
++    close(fd);
++    if (ret)
++        return ret;
++
++    driver[version.name_len < driver_len ? version.name_len : driver_len - 1] = '\0';
++    return 0;
++}
++
++/*
++ * Find the hw.dri.<N> index of the DRM device that owns /dev/drm/<id>.
++ *
++ * A primary node is easy: hw.dri.<N>.name names its device node.
++ *
++ * A render node is not named anywhere.  It used to be taken as device
++ * id - 128, which assumes every DRM device has both a card and a render node.
++ * drm_dev_init() allocates the render minor (from 128) and the primary minor
++ * (from 0) as two separate lowest-free sequences, and only for drivers that set
++ * DRIVER_RENDER does it allocate a render minor at all.  So a display-only
++ * device shifts them apart: on the Pi 5, card0 is vc4 (display only), card1 is
++ * v3d, and renderD128 belongs to v3d, not to hw.dri.0 (vc4).  The same happens
++ * with bochs or vboxvideo beside a GPU.
++ *
++ * What does hold is that DRIVER_RENDER is a property of the driver: every
++ * device of one driver has a render node or none does, and each device gets
++ * its render and primary minors together.  So among the devices of the render
++ * node's driver, the k-th render node belongs to the device with the k-th
++ * lowest primary minor.  The render node's driver comes from
++ * DRM_IOCTL_VERSION, which render nodes allow.
++ */
++static int get_sysctl_dri_index(int maj, int min)
++{
++    char dname[SPECNAMELEN];
++    char driver[DRM_SYSCTL_MAX_DEVICES][64];
++    char want[64], other[64];
++    int primary[DRM_SYSCTL_MAX_DEVICES];
++    int i, id, type, ret, ndev = 0, rank = 0, match = -1, last = -1;
++
++    if (!devname_r(makedev(maj, min), S_IFCHR, dname, sizeof(dname)))
++        return -EINVAL;
++    if (sscanf(dname, "drm/%d", &id) != 1)
+         return -EINVAL;
+     type = drmGetMinorType(maj, min);
+-    if (type == -1)
++    if (type != DRM_NODE_PRIMARY && type != DRM_NODE_RENDER)
+         return -EINVAL;
+ 
+-    /*
+-     * BUG: as in get_sysctl_pci_bus_info(), this assumes a driver creates both
+-     * a card and a render node, so that render minor 128 + X belongs to DRM
+-     * device X.  That holds only while there is a single render node.
+-     */
+-    switch (type) {
+-    case DRM_NODE_PRIMARY:
+-        break;
+-    case DRM_NODE_RENDER:
+-        id -= 128;
+-        break;
++    for (i = 0; i < DRM_SYSCTL_MAX_DEVICES; i++) {
++        if (get_sysctl_dri_name(i, driver[i], sizeof(driver[i]), &primary[i])) {
++            primary[i] = -1;
++            continue;
++        }
++        if (type == DRM_NODE_PRIMARY && primary[i] == id)
++            return i;
++        ndev++;
++        last = i;
+     }
+-    if (id < 0)
+-        return -EINVAL;
+ 
+-    if (snprintf(sysctl_name, sizeof(sysctl_name), "hw.dri.%d.busid", id) <= 0)
++    if (type == DRM_NODE_PRIMARY || ndev == 0)
++        return -ENODEV;
++
++    /* One DRM device: it owns every render node, nothing to open. */
++    if (ndev == 1)
++        return last;
++
++    ret = get_drm_node_driver(id, want, sizeof(want));
++    if (ret)
++        return ret;
++
++    /* How many render nodes below this one belong to the same driver? */
++    for (i = drmGetMinorBase(DRM_NODE_RENDER); i < id; i++) {
++        char path[64];
++
++        snprintf(path, sizeof(path), "/dev/drm/%d", i);
++        if (access(path, F_OK))
++            continue;
++        ret = get_drm_node_driver(i, other, sizeof(other));
++        if (ret)
++            return ret;
++        if (strcmp(other, want) == 0)
++            rank++;
++    }
++
++    /* The device of that driver with the rank-th lowest primary minor. */
++    for (i = 0; i < DRM_SYSCTL_MAX_DEVICES; i++) {
++        int j, below = 0;
++
++        if (primary[i] < 0 || strcmp(driver[i], want) != 0)
++            continue;
++        for (j = 0; j < DRM_SYSCTL_MAX_DEVICES; j++)
++            if (primary[j] >= 0 && primary[j] < primary[i] &&
++                strcmp(driver[j], want) == 0)
++                below++;
++        if (below == rank) {
++            match = i;
++            break;
++        }
++    }
++
++    return match >= 0 ? match : -ENODEV;
++}
++
++/*
++ * Read hw.dri.<N>.busid of the DRM device that owns the node (maj, min) into
++ * busid.  On a PCI device it reads "pci:<domain>:<bus>:<dev>.<func>"; on an SoC
++ * (platform) device "platform:<driver>.<unit>".
++ */
++static int get_sysctl_busid(int maj, int min, char *busid, size_t busid_len)
++{
++    char sysctl_name[32];
++    size_t sysctl_len;
++    int idx;
++
++    idx = get_sysctl_dri_index(maj, min);
++    if (idx < 0)
++        return idx;
++
++    if (snprintf(sysctl_name, sizeof(sysctl_name), "hw.dri.%d.busid", idx) <= 0)
+         return -EINVAL;
+ 
+     sysctl_len = busid_len;
+@@ -3738,44 +3872,11 @@ get_pci_path(int maj, int min, char *pci_path)
+ #ifdef __FreeBSD__
+ static int get_sysctl_pci_bus_info(int maj, int min, drmPciBusInfoPtr info)
+ {
+-    char dname[SPECNAMELEN];
+-    char sysctl_name[16];
+     char sysctl_val[256];
+-    size_t sysctl_len;
+-    int id, type, nelem;
+-    unsigned int rdev, majmin, domain, bus, dev, func;
+-
+-    rdev = makedev(maj, min);
+-    if (!devname_r(rdev, S_IFCHR, dname, sizeof(dname)))
+-      return -EINVAL;
+-
+-    if (sscanf(dname, "drm/%d\n", &id) != 1)
+-        return -EINVAL;
+-    type = drmGetMinorType(maj, min);
+-    if (type == -1)
+-        return -EINVAL;
+-
+-    /* BUG: This above section is iffy, since it mandates that a driver will
+-     * create both card and render node.
+-     * If it does not, the next DRM device will create card#X and
+-     * renderD#(128+X)-1.
+-     * This is a possibility in FreeBSD but for now there is no good way for
+-     * obtaining the info.
+-     */
+-    switch (type) {
+-    case DRM_NODE_PRIMARY:
+-         break;
+-    case DRM_NODE_RENDER:
+-         id -= 128;
+-         break;
+-    }
+-    if (id < 0)
+-        return -EINVAL;
++    int nelem;
++    unsigned int domain, bus, dev, func;
+ 
+-    if (snprintf(sysctl_name, sizeof(sysctl_name), "hw.dri.%d.busid", id) <= 0)
+-      return -EINVAL;
+-    sysctl_len = sizeof(sysctl_val);
+-    if (sysctlbyname(sysctl_name, sysctl_val, &sysctl_len, NULL, 0))
++    if (get_sysctl_busid(maj, min, sysctl_val, sizeof(sysctl_val)) != 0)
+       return -EINVAL;
+ 
+     #define bus_fmt "pci:%04x:%02x:%02x.%u"

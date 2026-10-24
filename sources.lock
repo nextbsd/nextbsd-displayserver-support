@@ -1,0 +1,46 @@
+# sources.lock: every upstream source nextbsd-displayserver-support builds, pinned.
+#
+# One line per component:  <name> <version> <sha256> <url>
+# <name> matches build_<name> in build-displayserver-support.sh (hyphens as
+# underscores) and patches/<name>/. build-displayserver-support.sh downloads
+# <url>, refuses it unless its SHA-256 is <sha256>, and unpacks it. Only
+# upstream release tarballs (or tag archives) are listed: no FreeBSD packages or
+# ports distfiles, no xsrc or xenocara. Bumping a version is a deliberate change
+# to this file.
+#
+# These are the pins nextbsd-xlibs and nextbsd-xlibre built before the move
+# (E25, "What moves"): keep them identical to those repos' until each has
+# dropped its copy. linux-input-shim is NextBSD's own (no upstream source) and
+# is not listed.
+
+# ---- graphics and fonts (from nextbsd-xlibs), in build order ----
+# libdrm: SHA-256 also matches FreeBSD ports' graphics/libdrm/distinfo.
+libdrm              2.4.134       ac5e74d157830eb8bee44c6a6bf3ad49774ef0dd2a72bdad74a8f20308b52a95  https://dri.freedesktop.org/libdrm/libdrm-2.4.134.tar.xz
+pixman              0.46.4        a098c33924754ad43f981b740f6d576c70f9ed1006e12221b1845431ebce1239  https://xorg.freedesktop.org/archive/individual/lib/pixman-0.46.4.tar.xz
+expat               2.9.0         1e6371862cc31999b368c3b89b49994f0677e1bab5f1b2b85ae3741f5d803051  https://github.com/libexpat/libexpat/releases/download/R_2_9_0/expat-2.9.0.tar.xz
+freetype            2.15.0        93cd47eb719c325107f2d3cf087d06299e944c3b48a40b55537302304dea1dd5  https://download.savannah.gnu.org/releases/freetype/freetype-2.15.0.tar.xz
+fontconfig          2.18.3        4f7b554a38cdf78c033f666c8871f3749e14a094f65a07f630c91ed0b43d35e3  https://gitlab.freedesktop.org/api/v4/projects/890/packages/generic/fontconfig/2.18.3/fontconfig-2.18.3.tar.xz
+
+# ---- keyboard (xkeyboard-config from nextbsd-xlibre, libxkbcommon from nextbsd-xlibs) ----
+xkeyboard-config    2.48          b77041324f0109f77161ee43743fe04baa485866af8460d31e476ad3f7648fd5  https://xorg.freedesktop.org/archive/individual/data/xkeyboard-config/xkeyboard-config-2.48.tar.xz
+# libxkbcommon is a GitHub tag archive: upstream publishes no release tarball.
+# nextbsd-xlibs builds libxkbcommon-x11 from this same tarball (E25 D5): keep
+# the two pins equal.
+libxkbcommon        1.13.2        acc4d5f7c3cbba5f9f8d08d8bdbeede84ecede46792f47929aa9321873385528  https://github.com/xkbcommon/libxkbcommon/archive/refs/tags/xkbcommon-1.13.2.tar.gz
+
+# ---- the input stack (from nextbsd-xlibre), in build order ----
+# epoll-shim publishes no release tarball: a GitHub tag archive.
+epoll-shim          0.0.20240608  8f5125217e4a0eeb96ab01f9dfd56c38f85ac3e8f26ef2578e538e72e87862cb  https://github.com/jiixyj/epoll-shim/archive/refs/tags/v0.0.20240608.tar.gz
+# libudev-devd: a GitHub tag archive (no release tarball), wulf7's repo, which
+# FreeBSD's devel/libudev-devd also fetches. 0.7.0, unmodified (E23 D10).
+libudev-devd        0.7.0         a3a64de87ea1affb2485dac625c8d47714a766717315ffe0443be1f240206815  https://github.com/wulf7/libudev-devd/archive/refs/tags/v0.7.0.tar.gz
+libevdev            1.14.0        5a0966c7110648665983848bad696c7acba614a2160d2865d535397101007332  https://www.freedesktop.org/software/libevdev/libevdev-1.14.0.tar.xz
+mtdev               1.1.7         a107adad2101fecac54ac7f9f0e0a0dd155d954193da55c2340c97f2ff1d814e  https://bitmath.org/code/mtdev/mtdev-1.1.7.tar.bz2
+# libinput publishes its releases as GitLab tag archives.
+libinput            1.32.0        3a6065c07b118c08d0c7b7b85a265ecb050a8cfc91eeb360890d768a51b4cce9  https://gitlab.freedesktop.org/libinput/libinput/-/archive/1.32.0/libinput-1.32.0.tar.bz2
+
+# ---- host build tools (built on the runner, used at build time, never shipped) ----
+# gperf: fontconfig generates its object hash with it. Used from the toolchain
+# image when the image has it; otherwise built here from this pin (README.md,
+# "Host build tools").
+gperf               3.3           fd87e0aba7e43ae054837afd6cd4db03a3f2693deb3619085e6ed9d8d9604ad8  https://mirrors.kernel.org/gnu/gperf/gperf-3.3.tar.gz

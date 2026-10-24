@@ -1,0 +1,189 @@
+Description: Report DRM platform (SoC) devices on FreeBSD-based kernels
+ libdrm's FreeBSD code reported every DRM node as DRM_BUS_PCI and parsed its
+ hw.dri.<N>.busid as "pci:<domain>:<bus>:<dev>.<func>". On an SoC the busid
+ reads "platform:<driver>.<unit>" (vc4 and v3d on the Raspberry Pi 5), the
+ parse failed, and the node was dropped: drmGetDevices2() found no devices and
+ EGL/GBM fell back to llvmpipe. This adds get_sysctl_busid(), returns
+ DRM_BUS_PLATFORM for a "platform:" busid, and implements drmParseOFBusInfo()
+ and drmParseOFDeviceInfo() from the busid and dev.<driver>.<unit>.%pnpinfo
+ ("compat=").
+ .
+ It keeps upstream's assumption that render node 128 + X belongs to DRM device
+ X; 0003-xf86drm-render-node-owner.patch fixes that.
+Origin: nextbsd-ports d3479089952d, graphics/libdrm/files/patch-xf86drm.c
+ (NextBSD), converted from the port's -p0 form to -p1
+Forwarded: no (offered upstream once the render-node mapping is fixed)
+---
+diff --git a/xf86drm.c b/xf86drm.c
+index 53d1354..30c743f 100644
+--- a/xf86drm.c
++++ b/xf86drm.c
+@@ -3618,6 +3618,60 @@ static int get_subsystem_type(const char *device_path)
+ }
+ #endif
+ 
++#ifdef __FreeBSD__
++/*
++ * Read hw.dri.<N>.busid for the DRM node (maj, min) into busid.
++ *
++ * Factored out of get_sysctl_pci_bus_info() so the bus string can be examined
++ * before it is parsed: on an SoC (platform) device it reads
++ * "platform:<driver>.<unit>" rather than "pci:<domain>:<bus>:<dev>.<func>".
++ */
++static int get_sysctl_busid(int maj, int min, char *busid, size_t busid_len)
++{
++    char dname[SPECNAMELEN];
++    char sysctl_name[32];
++    size_t sysctl_len;
++    int id, type;
++    unsigned int rdev;
++
++    rdev = makedev(maj, min);
++    if (!devname_r(rdev, S_IFCHR, dname, sizeof(dname)))
++        return -EINVAL;
++
++    if (sscanf(dname, "drm/%d\n", &id) != 1)
++        return -EINVAL;
++    type = drmGetMinorType(maj, min);
++    if (type == -1)
++        return -EINVAL;
++
++    /*
++     * BUG: as in get_sysctl_pci_bus_info(), this assumes a driver creates both
++     * a card and a render node, so that render minor 128 + X belongs to DRM
++     * device X.  That holds only while there is a single render node.
++     */
++    switch (type) {
++    case DRM_NODE_PRIMARY:
++        break;
++    case DRM_NODE_RENDER:
++        id -= 128;
++        break;
++    }
++    if (id < 0)
++        return -EINVAL;
++
++    if (snprintf(sysctl_name, sizeof(sysctl_name), "hw.dri.%d.busid", id) <= 0)
++        return -EINVAL;
++
++    sysctl_len = busid_len;
++    if (sysctlbyname(sysctl_name, busid, &sysctl_len, NULL, 0))
++        return -EINVAL;
++
++    busid[busid_len - 1] = '\0';
++
++    return 0;
++}
++#endif
++
+ static int drmParseSubsystemType(int maj, int min)
+ {
+ #ifdef __linux__
+@@ -3639,7 +3693,23 @@ static int drmParseSubsystemType(int maj, int min)
+             return DRM_BUS_VIRTIO;
+      }
+     return subsystem_type;
+-#elif defined(__OpenBSD__) || defined(__DragonFly__) || defined(__FreeBSD__)
++#elif defined(__FreeBSD__)
++    char busid[256];
++
++    /*
++     * FreeBSD used to unconditionally report DRM_BUS_PCI here, which made
++     * DRM_BUS_PLATFORM unreachable: every node was then handed to
++     * drmProcessPciDevice(), whose "pci:%04x:%02x:%02x.%u" parse fails on an
++     * SoC busid such as "platform:v3d.0", so the node was dropped entirely.
++     */
++    if (get_sysctl_busid(maj, min, busid, sizeof(busid)) != 0)
++        return DRM_BUS_PCI;
++
++    if (strncmp(busid, "platform:", 9) == 0)
++        return DRM_BUS_PLATFORM;
++
++    return DRM_BUS_PCI;
++#elif defined(__OpenBSD__) || defined(__DragonFly__)
+     return DRM_BUS_PCI;
+ #else
+ #warning "Missing implementation of drmParseSubsystemType"
+@@ -4318,6 +4388,20 @@ static int drmParseOFBusInfo(int maj, int min, char *fullname)
+     fullname[DRM_PLATFORM_DEVICE_NAME_LEN - 1] = '\0';
+     free(name);
+ 
++    return 0;
++#elif defined(__FreeBSD__)
++    char busid[256];
++
++    if (get_sysctl_busid(maj, min, busid, sizeof(busid)) != 0)
++        return -EINVAL;
++
++    if (strncmp(busid, "platform:", 9) != 0)
++        return -EINVAL;
++
++    /* "platform:v3d.0" -> "v3d.0" */
++    strncpy(fullname, busid + 9, DRM_PLATFORM_DEVICE_NAME_LEN);
++    fullname[DRM_PLATFORM_DEVICE_NAME_LEN - 1] = '\0';
++
+     return 0;
+ #else
+ #warning "Missing implementation of drmParseOFBusInfo"
+@@ -4379,6 +4463,61 @@ free:
+ 
+     free(*compatible);
+     return err;
++#elif defined(__FreeBSD__)
++    char busid[256];
++    char driver[32];
++    char sysctl_name[64];
++    char pnpinfo[1024];
++    size_t sysctl_len;
++    char *compat, *end;
++    unsigned int unit;
++
++    if (get_sysctl_busid(maj, min, busid, sizeof(busid)) != 0)
++        return -EINVAL;
++
++    if (strncmp(busid, "platform:", 9) != 0)
++        return -EINVAL;
++
++    /* "platform:v3d.0" -> newbus driver "v3d", unit 0 */
++    if (sscanf(busid + 9, "%31[^.].%u", driver, &unit) != 2)
++        return -EINVAL;
++
++    if (snprintf(sysctl_name, sizeof(sysctl_name), "dev.%s.%u.%%pnpinfo",
++                 driver, unit) <= 0)
++        return -EINVAL;
++
++    sysctl_len = sizeof(pnpinfo);
++    if (sysctlbyname(sysctl_name, pnpinfo, &sysctl_len, NULL, 0))
++        return -EINVAL;
++    pnpinfo[sizeof(pnpinfo) - 1] = '\0';
++
++    /* pnpinfo reads e.g. "name=v3d@2000000 compat=brcm,2712-v3d" */
++    compat = strstr(pnpinfo, "compat=");
++    if (compat) {
++        compat += 7;
++
++        end = compat;
++        while (*end != '\0' && *end != ' ' && *end != '\t' && *end != '\n')
++            end++;
++        *end = '\0';
++    }
++
++    /* Fall back to the newbus driver name if the node has no compat key. */
++    if (!compat || *compat == '\0')
++        compat = driver;
++
++    *compatible = calloc(2, sizeof(char *));
++    if (!*compatible)
++        return -ENOMEM;
++
++    (*compatible)[0] = strdup(compat);
++    if (!(*compatible)[0]) {
++        free(*compatible);
++        *compatible = NULL;
++        return -ENOMEM;
++    }
++
++    return 0;
+ #else
+ #warning "Missing implementation of drmParseOFDeviceInfo"
+     return -EINVAL;

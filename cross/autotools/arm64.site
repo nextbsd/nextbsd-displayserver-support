@@ -1,0 +1,11 @@
+# Autotools cross "file" for NextBSD arm64: a CONFIG_SITE script, sourced by
+# every configure that build-displayserver-support.sh runs for this arch.
+# configure is also given --build=<host triple> --host=aarch64-unknown-freebsd
+# and --with-sysroot.
+#
+# Per-arch answers to configure checks that would have to run a target program
+# go here, each with its reason. Answers common to both arches go in common.site.
+
+dss_triple=aarch64-unknown-freebsd
+
+. "${DSS_CROSS:?}/autotools/common.site"

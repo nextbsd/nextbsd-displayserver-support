@@ -1,0 +1,11 @@
+# libdrm 2.4.134 (sources.lock). Applied in order by build-displayserver-support.sh.
+#
+# From nextbsd-ports (graphics/libdrm/files, d3479089952d). Its third patch,
+# patch-symbols-check.py, is not carried: it only changes the `meson test`
+# symbol check, which the cross build does not run (and which would see the
+# Linux runner, not NextBSD).
+0001-libsync-define-ETIME.patch
+0002-xf86drm-platform-bus.patch
+# NextBSD: the render-node fix (nextbsd/nextbsd-xlibs#2; moved here with
+# libdrm, E25).
+0003-xf86drm-render-node-owner.patch

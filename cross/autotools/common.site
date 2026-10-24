@@ -1,0 +1,39 @@
+# Shared part of the autotools CONFIG_SITE files (amd64.site, arm64.site).
+#
+# Expects in the environment (exported by build-displayserver-support.sh):
+#   SYSROOT       the staged NextBSD base, with earlier components in /usr
+#   CROSS_BINDIR  the toolchain image's pinned clang/lld 19.1.7
+#   DSS_CROSS     this directory's parent (cross/)
+# and dss_triple from the per-arch file that sources this one.
+
+: "${SYSROOT:?}" "${CROSS_BINDIR:?}" "${dss_triple:?}"
+
+# The cross compiler. -fuse-ld=lld is part of CC/CXX, not LDFLAGS: older
+# bundled libtool (e.g. gmp's, libao's) drops it from LDFLAGS on link lines,
+# so arm64 then links with the runner's x86 ld and amd64 silently with GNU ld.
+# clang finds ld.lld beside itself; the flag is ignored when only compiling.
+CC="$CROSS_BINDIR/clang --target=$dss_triple --sysroot=$SYSROOT -fuse-ld=lld"
+CXX="$CROSS_BINDIR/clang++ --target=$dss_triple --sysroot=$SYSROOT -fuse-ld=lld"
+CFLAGS="${CFLAGS:--O2 -pipe}"
+CXXFLAGS="${CXXFLAGS:--O2 -pipe}"
+LDFLAGS="${LDFLAGS:-}"
+AR="$CROSS_BINDIR/llvm-ar"
+RANLIB="$CROSS_BINDIR/llvm-ranlib"
+NM="$CROSS_BINDIR/llvm-nm"
+STRIP="$CROSS_BINDIR/llvm-strip"
+OBJCOPY="$CROSS_BINDIR/llvm-objcopy"
+
+# Programs that run on the build host during a build use the host compiler.
+CC_FOR_BUILD=cc
+
+# pkgconf (ISC), never freedesktop's GPL pkg-config. Only the sysroot's .pc
+# directory (the base's /usr/libdata/pkgconfig, where this repo's .pc files go
+# too) is searched, and -I/-L results are prefixed with the sysroot.
+PKG_CONFIG=pkgconf
+PKG_CONFIG_LIBDIR="$SYSROOT/usr/libdata/pkgconfig"
+PKG_CONFIG_SYSROOT_DIR="$SYSROOT"
+export PKG_CONFIG_LIBDIR PKG_CONFIG_SYSROOT_DIR
+
+# Cache answers for checks that must run a target program, common to both
+# arches. Each needs a reason, e.g.:
+#   name_cv_check=value   # why this is the NextBSD answer

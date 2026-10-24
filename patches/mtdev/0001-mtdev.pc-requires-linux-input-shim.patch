@@ -1,0 +1,18 @@
+Description: mtdev.pc requires linux-input-shim
+ The installed mtdev.h includes <linux/input.h>. NextBSD has no
+ /usr/include/linux: nextbsd-displayserver-support's linux-input-shim installs
+ the header (an #include of the base kernel's <dev/evdev/input.h>) in
+ /usr/include/linux-input-shim and adds that directory through its own
+ linux-input-shim.pc. Requiring it here makes `pkgconf --cflags mtdev` enough
+ to compile against the installed mtdev.h.
+Origin: NextBSD (nextbsd/nextbsd-displayserver-support#1, E25)
+Forwarded: not-needed
+--- a/mtdev.pc.in
++++ b/mtdev.pc.in
+@@ -6,5 +6,6 @@
+ Name: mtdev
+ Description: Multitouch Protocol Translation Library
+ Version: @PACKAGE_VERSION@
++Requires: linux-input-shim
+ Libs: -L${libdir} -lmtdev
+ Cflags: -I${includedir}
