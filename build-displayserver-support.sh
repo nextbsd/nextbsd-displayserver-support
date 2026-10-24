@@ -36,6 +36,9 @@
 #   /etc/fonts                                                fontconfig's config:
 #       built and staged into the sysroot, but NOT in the artifact; the image
 #       gets it from nextbsd-overlays, which owns /etc (nextbsd-overlays#26)
+#   /System/Library/LaunchDaemons/org.nextbsd.fc-cache.plist  the font-cache job
+#       (launchd/), next to the userland's daemons, as nextbsd-printing-support
+#       ships cupsd's
 #
 # EXECUTION CONTEXT (set up by CI before this runs)
 #   Inside the nextbsd-kernel-toolchain container (pinned clang/lld 19.1.7 in
@@ -78,6 +81,9 @@ LOCALSTATEDIR=/var
 # (fontconfig's X fonts, libxkbcommon's Compose tables from libX11). Nothing
 # here installs there.
 X_PREFIX=/usr/X11
+# The only file installed outside $PREFIX: fontconfig's launchd job (launchd/),
+# next to the userland's jobs.
+LAUNCHD_DIR=/System/Library/LaunchDaemons
 
 # The only places a component may install into (a file must be one of these
 # or under one).
@@ -97,6 +103,7 @@ ALLOWED="
     usr/share/X11/xkb
     usr/share/libinput
     etc/fonts
+    System/Library/LaunchDaemons/org.nextbsd.fc-cache.plist
 "
 # Staged into the sysroot, left out of the artifact: /etc belongs to
 # nextbsd-overlays (nextbsd-pkg#25), which ships /etc/fonts (nextbsd-overlays#26).
@@ -416,6 +423,32 @@ stage() {
     note "staged $(cd "$r" && find . ! -type d | wc -l) files ($(cd "$r" && find "./$ARTIFACT_EXCLUDE" ! -type d 2>/dev/null | wc -l) under /$ARTIFACT_EXCLUDE: sysroot only, not in the artifact)"
 }
 
+# launchd_check <plist> <label> <program>: a well-formed launchd job (xmllint
+# if the image has it, else a structural grep) with NextBSD's label, running a
+# program this repo ships, and silent: stdout and stderr go to a file, never
+# the console.
+launchd_check() {
+    local p="$1" label="$2" prog="$3"
+    [ -f "$p" ] || fail "${p#"$DESTDIR"} was not staged"
+    if command -v xmllint >/dev/null 2>&1; then
+        xmllint --noout "$p" || fail "${p#"$DESTDIR"} is not well-formed XML"
+    else
+        grep -q '^<plist version="1.0">$' "$p" && grep -q '^</plist>$' "$p" \
+            || fail "${p#"$DESTDIR"} is not a plist"
+    fi
+    grep -q "<string>$label</string>" "$p" || fail "${p#"$DESTDIR"} does not carry the $label label"
+    grep -q "<string>$prog</string>" "$p" || fail "${p#"$DESTDIR"} does not run $prog"
+    [ -x "$DESTDIR$prog" ] || fail "${p#"$DESTDIR"} runs $prog, which is not staged"
+    if grep -n '<string>com\.apple\.' "$p"; then
+        fail "${p#"$DESTDIR"} carries an Apple identifier"
+    fi
+    for k in StandardOutPath StandardErrorPath; do
+        grep -A1 "<key>$k</key>" "$p" | grep -q '<string>/var/log/' \
+            || fail "${p#"$DESTDIR"}: $k does not go to /var/log"
+    done
+    note "launchd job ok: $label (${p#"$DESTDIR"})"
+}
+
 # pc_check <module> [version]: the staged .pc resolves through pkgconf the way
 # later components will see it (and, if given, at that version).
 pc_check() {
@@ -589,9 +622,10 @@ build_freetype() {
 #              /usr/X11/share/fonts (XLibre's fonts)
 # /etc/fonts is built and staged into the sysroot (and printed below) but is
 # not in the artifact: nextbsd-overlays ships it (nextbsd-overlays#26), and an
-# org.nextbsd.fc-cache launchd job builds the cache. fc-cache cannot run at
-# install time on the build host (cache-build off); the tools (fc-cache,
-# fc-list, fc-match, ...) are built and shipped. No NLS, iconv, docs or tests.
+# org.nextbsd.fc-cache launchd job (launchd/, installed here next to fc-cache)
+# builds the cache at boot. fc-cache cannot run at install time on the build
+# host (cache-build off); the tools (fc-cache, fc-list, fc-match, ...) are
+# built and shipped. No NLS, iconv, docs or tests.
 build_fontconfig() {
     host_gperf
     comp "fontconfig [meson cross]"
@@ -605,6 +639,8 @@ build_fontconfig() {
         -Dcache-dir="$LOCALSTATEDIR/cache/fontconfig" \
         -Ddefault-fonts-dirs=/System/Library/Fonts,/Local/Library/Fonts,/Network/Library/Fonts,~/Library/Fonts \
         -Dadditional-fonts-dirs="$X_PREFIX/share/fonts"
+    install -d -m 0755 "$COMP_ROOT$LAUNCHD_DIR"
+    install -m 0644 "$ROOT/launchd/org.nextbsd.fc-cache.plist" "$COMP_ROOT$LAUNCHD_DIR/"
     stage fontconfig
     local x="$DESTDIR$PREFIX" conf="$SYSROOT$SYSCONFDIR/fonts/fonts.conf" d
     test -f "$conf" || fail "$SYSCONFDIR/fonts/fonts.conf not built"
@@ -624,6 +660,7 @@ build_fontconfig() {
     names_path "$x/lib/libfontconfig.so.1" "$SYSCONFDIR/fonts" "$LOCALSTATEDIR/cache/fontconfig" \
         "$PREFIX/share/fontconfig/conf.avail"
     pc_check fontconfig "$VERSION"
+    launchd_check "$DESTDIR$LAUNCHD_DIR/org.nextbsd.fc-cache.plist" org.nextbsd.fc-cache /usr/bin/fc-cache
     # What nextbsd-overlays should ship as /etc/fonts (nextbsd-overlays#26).
     echo "    - $SYSCONFDIR/fonts as built (sysroot only; nextbsd-overlays ships it):"
     (cd "$SYSROOT$SYSCONFDIR/fonts" && find . ! -type d | LC_ALL=C sort | while IFS= read -r f; do
