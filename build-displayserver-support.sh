@@ -872,15 +872,16 @@ build_mtdev() {
 
 # input_headers_check: the installed libevdev.h, libevdev-uinput.h and mtdev.h
 # compile, alone and together, with only `pkgconf --cflags` of their own
-# modules (no -I added by hand), and what the drivers use from the shim is
-# there.
+# modules (no -I added by hand), and what the drivers use from the shim
+# (<linux/uinput.h>'s struct uinput_setup among it; libevdev-uinput.h only
+# forward-declares the uinput structures) is there.
 input_headers_check() {
     local t="$BUILD/input-headers-$T" mods cflags src
     mkdir -p "$t"
     printf '%s\n' '#include <sys/ioctl.h>' '#include <libevdev/libevdev.h>' \
         '#include <libevdev/libevdev-uinput.h>' \
-        'int f(int fd) { struct input_event ev; struct input_absinfo ai; struct uinput_setup us;' \
-        '  (void)ev; (void)ai; (void)us; return ioctl(fd, EVIOCGRAB, 1) + KEY_MAX + BUS_USB; }' > "$t/libevdev.c"
+        'int f(int fd) { struct input_event ev; struct input_absinfo ai;' \
+        '  (void)ev; (void)ai; return ioctl(fd, EVIOCGRAB, 1) + KEY_MAX + BUS_USB; }' > "$t/libevdev.c"
     printf '%s\n' '#include <mtdev.h>' \
         'int f(void) { struct input_event ev; (void)ev; return ABS_MT_SLOT + MT_ABS_SIZE; }' > "$t/mtdev.c"
     printf '%s\n' '#include <sys/ioctl.h>' '#include <libevdev/libevdev.h>' \
