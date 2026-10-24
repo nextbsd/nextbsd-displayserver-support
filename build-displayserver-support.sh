@@ -826,7 +826,8 @@ build_libudev() {
     lib="$x/lib/libudev.so.0"
     test -f "$x/include/libudev.h" || fail "libudev.h not staged"
     so_check libudev.so.0
-    lib_needs libudev.so.0 libIOKit.so.1 libCoreFoundation.so.6 libsystem_dispatch.so.0 \
+    # (userland's libdispatch has an unversioned soname, libsystem_dispatch.so.)
+    lib_needs libudev.so.0 libIOKit.so.1 libCoreFoundation.so.6 libsystem_dispatch.so \
         libdevinfo.so libprocstat.so
     # The IOKit device source and monitor are what was compiled, and the
     # devd monitor is gone.
