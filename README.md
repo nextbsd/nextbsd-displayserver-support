@@ -3,8 +3,8 @@
 The libraries and data that both of NextBSD's display servers share, built from
 pinned upstream release tarballs into **`/usr`**: libdrm, pixman, expat,
 freetype, fontconfig, xkeyboard-config, libxkbcommon, and the input stack
-(epoll-shim, libudev-devd, the `<linux/input.h>` shim, libevdev, mtdev,
-libinput). The GNUstep WindowServer (built by Gershwin) and XLibre (kept as the
+(epoll-shim, NextBSD's IOKit libudev, the `<linux/input.h>` shim, libevdev,
+mtdev, libinput). The GNUstep WindowServer (built by Gershwin) and XLibre (kept as the
 compatibility server for X apps) both build on them. None of them links an X
 library, and nothing here uses Wayland.
 
@@ -15,7 +15,9 @@ only the install paths changed (`/usr/X11` → `/usr`, decision D4). The repos
 are built by hand in this order:
 
 ```
-nextbsd-freebsd-compat          the NextBSD base (the only sysroot input here)
+nextbsd-freebsd-compat          the NextBSD base
+        │
+nextbsd-userland                libIOKit, CoreFoundation, libdispatch (for libudev)
         │
 nextbsd-displayserver-support   libdrm, fonts, xkb, input stack     <- this repo
         │
@@ -47,8 +49,10 @@ nextbsd-xlibs. The repo follows
    Nothing goes in `/usr/local` or `/usr/X11`, and the artifact ships nothing
    in `/etc`: configuration belongs to nextbsd-overlays. The one file outside
    `/usr` is fontconfig's launchd job, in `/System/Library/LaunchDaemons`.
-5. **Only the NextBSD base sysroot is linked against** (compat's `continuous`
-   base), never nextbsd-userland or the X repos. Build tools come from the
+5. **Only the NextBSD base is linked against**: compat's `continuous` base,
+   plus nextbsd-userland's `continuous` artifact for libudev alone (libIOKit,
+   CoreFoundation and libdispatch in `/usr/lib/system`; see
+   [libudev](#libudev)). Never the X repos. Build tools come from the
    toolchain image (or, for gperf, are built on the runner) and never ship.
 6. **pkgconf, never freedesktop's GPL pkg-config.** No Wayland (E25 D2), no
    D-Bus, no Avahi.
@@ -76,14 +80,14 @@ Nothing upstream is committed. `build-displayserver-support.sh` downloads into
 
 `build-displayserver-support.sh` runs inside the `nextbsd-kernel-toolchain`
 container (the pinned clang/lld 19.1.7, meson, ninja, cmake, pkgconf,
-autotools, python3, perl and bison) with compat's `continuous` base extracted
-as the sysroot. It needs:
+autotools, python3, perl and bison) with compat's `continuous` base and then
+nextbsd-userland's `continuous` artifact extracted as the sysroot. It needs:
 
 | Variable | Meaning |
 |---|---|
 | `T` | target: `amd64` or `arm64` |
 | `TA` | FreeBSD `TARGET_ARCH`: `amd64` or `aarch64` |
-| `SYSROOT` | compat's base alone; scratch, since each component is installed into its `/usr` |
+| `SYSROOT` | compat's base with nextbsd-userland's artifact on top; scratch, since each component is installed into its `/usr` |
 | `CROSS_BINDIR` | the toolchain's clang, lld and LLVM binutils (set by the container image) |
 | `DESTDIR` | where to stage the artifact; default `/stage` |
 
@@ -119,7 +123,8 @@ For each component, in `COMPONENTS` order, it:
    through pkgconf.
 
 At the end every ELF object in the artifact is checked once more: each
-`DT_NEEDED` is a library of the NextBSD base or of this repo, and none is an X
+`DT_NEEDED` is a library of the NextBSD base or of this repo (for libudev
+alone, also of nextbsd-userland's `/usr/lib/system`), and none is an X
 library, libwayland or D-Bus. In particular **libinput and libxkbcommon don't
 link libwayland** (E25 D2).
 
@@ -171,7 +176,7 @@ the build sysroot prefixed, and that root has no option to override it).
 | `libxkbcommon` | 1.13.2 | meson | `libxkbcommon.so.0`, core only (`-Denable-x11=false`; `libxkbcommon-x11` stays in nextbsd-xlibs, E25 D5) | nextbsd-xlibs |
 | `xkeyboard-config` | 2.48 | meson | the XKB keymap data | nextbsd-xlibre |
 | `epoll-shim` | 0.0.20240608 | CMake | `libepoll-shim.so.0`, `libepoll-shim-interpose.so.0`, headers in `libepoll-shim/` | nextbsd-xlibre |
-| `libudev-devd` | 0.7.0 | meson | `libudev.so.0`, `libudev.h` (unmodified; replaced later by the IOKit libudev with the same soname, E25 D7) | nextbsd-xlibre |
+| `libudev` | NextBSD (on libudev-devd 0.7.0) | meson | `libudev.so.0`, `libudev.h`, `libudev.pc`: the IOKit libudev (E25 D7, see [libudev](#libudev)). Patched: input devices from the IORegistry, monitor on IOKit notifications (`patches/libudev/`) | nextbsd-xlibre (libudev-devd) |
 | `linux-input-shim` | NextBSD | headers | `<linux/input.h>`, `<linux/input-event-codes.h>`, `<linux/uinput.h>`, `linux-input-shim.pc` | nextbsd-xlibre |
 | `libevdev` | 1.14.0 | meson | `libevdev.so.2`, three tools. Patched: `.pc` requires `linux-input-shim` | nextbsd-xlibre |
 | `mtdev` | 1.1.7 | autotools | `libmtdev.so.1`, `mtdev-test`. Patched: `.pc` requires `linux-input-shim` | nextbsd-xlibre |
@@ -224,6 +229,66 @@ The build checks that the job is well-formed, carries the
 `org.nextbsd.fc-cache` label, runs the staged `/usr/bin/fc-cache` and logs to
 `/var/log`.
 
+### libudev
+
+NextBSD's libudev is libudev-devd 0.7.0 with its input device source and its
+monitor replaced (`patches/libudev/`, `Origin: NextBSD`), so libinput, and
+through it XLibre and the WindowServer, see input devices that appear after
+they start, without devd (nextbsd/nextbsd#482). The rest of libudev-devd (the
+device, list, filter and enumerate objects, `/dev/dri/card*` and the other
+devfs nodes) is unchanged, and so are the soname `libudev.so.0`,
+`/usr/include/libudev.h` and `libudev.pc` (which claims udev 243's API level,
+as before).
+
+- **Enumeration.** The kernel publishes every `/dev/input/eventN` as an
+  `IOHIDDevice` registry entry (nextbsd-kernel#331).
+  `udev_enumerate_scan_devices` lists them with
+  `IOServiceGetMatchingServices(IOServiceMatching("IOHIDDevice"))`; if the
+  registry cannot be reached, or has no such entries, devfs is scanned as
+  before.
+- **Properties.** An input device is built from its entry's keys:
+
+  | udev | IORegistry key |
+  |---|---|
+  | syspath, devnode, `DEVNAME` | `org.nextbsd.DevNode` (`/dev/input/eventN`); sysname `eventN`, subsystem `input` |
+  | `MAJOR`, `MINOR`, devnum | `BSD Major`, `BSD Minor` |
+  | `ID_INPUT=1` and the type tags | `PrimaryUsagePage`/`PrimaryUsage`: Keyboard → `ID_INPUT_KEY` + `ID_INPUT_KEYBOARD`; Keypad, System Control, Consumer Control → `ID_INPUT_KEY`; Mouse, Pointer → `ID_INPUT_MOUSE`; Joystick, Game Pad → `ID_INPUT_JOYSTICK`; Touch Pad → `ID_INPUT_MOUSE` + `ID_INPUT_TOUCHPAD`; Touch Screen → `ID_INPUT_TOUCHSCREEN`; Digitizer, Pen → `ID_INPUT_TABLET`; Accelerometer → `ID_INPUT_ACCELEROMETER` |
+  | `ID_VENDOR_ID`, `ID_MODEL_ID` | `VendorID`, `ProductID` (`%04x`) |
+  | `ID_INTEGRATION` | `Transport`: I2C, SPI, PS2 → `internal`; USB, Bluetooth → `external` |
+  | parent sysname | `org.nextbsd.evdev.Phys` (the driver, e.g. `hms0`), `uinput` if empty |
+  | parent `NAME`, sysattr `name` | `Product`, cut at the first comma |
+  | parent `PRODUCT` | `org.nextbsd.evdev.BusType`/`VendorID`/`ProductID`/`VersionNumber` (`%x/%x/%x/%x`) |
+  | parent `UNIQ` | `SerialNumber` |
+
+  That is the device-plus-synthetic-parent shape libudev-devd built from the
+  `kern.evdev.input` sysctls, which libinput's quirks and XLibre's
+  `config/udev.c` read. A node with no entry, or whose usage has no udev type
+  (a switch-only node), is still classified from those sysctls.
+- **Monitor.** `udev_monitor_enable_receiving` registers
+  `IOServiceAddMatchingNotification` for first-match and terminated
+  `IOHIDDevice` entries, delivered on a private serial dispatch queue. Each
+  event is queued and one byte written to a pipe; `udev_monitor_get_fd` is the
+  pipe's read end, so it polls with poll, kqueue or epoll-shim like any fd.
+  `udev_monitor_receive_device` builds the device and applies the filters on
+  the caller's thread. A removal carries the syspath its add had (a registry
+  id → syspath cache; a terminated entry also stays readable while it
+  lingers). Entries present when the monitor starts are remembered, not
+  reported (the caller enumerates them). The watch only starts for a monitor
+  that can take `input` devices. No devd socket is opened.
+- **DRM.** `/dev/dri/card*` is enumerated from devfs as before. There are no
+  DRM hotplug events until the kernel sends connector changes as IOKit
+  interest notifications (nextbsd-kernel#338).
+
+libudev links libIOKit, CoreFoundation and libdispatch, which
+nextbsd-userland installs in `/usr/lib/system`; the dynamic linker finds them
+through ldconfig's `/usr/lib/system` entry, so there is no RPATH. At build
+time `-L<sysroot>/usr/lib/system` goes only in meson's `c_link_args`, so
+neither the library nor `libudev.pc` names a build path. The build checks the
+soname, that it links those libraries, that the IOKit code is compiled in and
+the devd socket path is not, and that a program calling every libudev
+function libinput 1.32, XLibre's `config/udev.c` and its modesetting driver use
+builds and links with nothing but `pkgconf --cflags --libs libudev`.
+
 ### linux-input-shim
 
 libevdev's and mtdev's installed headers include `<linux/input.h>`, and
@@ -255,8 +320,9 @@ built on the runner with the host compiler and used only during the build
 ## CI, artifact, package
 
 `.github/workflows/build.yml` builds amd64 and arm64 on pull requests, pushes
-to `main` and manual runs, each inside its arch's toolchain image with only
-compat's `continuous` base as the sysroot. Pushes to `main` and manual runs
+to `main` and manual runs, each inside its arch's toolchain image with
+compat's `continuous` base and nextbsd-userland's `continuous` artifact as the
+sysroot. Pushes to `main` and manual runs
 from `main` publish `nextbsd-displayserver-support-<arch>.tar.gz` (the whole
 `/usr` install, headers and `.pc` files included, rooted at `/`) to the
 `continuous` release. Pull requests only build. Nothing is dispatched to or

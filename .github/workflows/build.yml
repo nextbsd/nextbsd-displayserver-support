@@ -4,7 +4,8 @@ name: Build NextBSD displayserver-support (libraries shared by the display serve
 # pixman, expat, freetype, fontconfig, xkeyboard-config, libxkbcommon and the
 # input stack) into /usr for amd64 and arm64 on the x86_64 runner, inside the
 # per-arch nextbsd-kernel-toolchain container, against compat's `continuous`
-# base as the sysroot, from the pinned tarballs in sources.lock. Publishes
+# base with nextbsd-userland's `continuous` artifact on top (libIOKit for the
+# IOKit libudev) as the sysroot, from the pinned tarballs in sources.lock. Publishes
 # nextbsd-displayserver-support-<arch>.tar.gz to this repo's `continuous`
 # release on pushes to main and on manual runs from main; pull requests build
 # only.
@@ -47,14 +48,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Stage the cross sysroot from compat's `continuous` base alone: libc,
-      # libthr, libz, libbz2, libdevinfo, libprocstat and friends, plus headers
-      # (dev/evdev/ for the input shim) and /usr/libdata/pkgconfig. Nothing
-      # here links X, so no other artifact is staged. A public read, so the
-      # built-in token is enough and fork PRs work.
+      # Stage the cross sysroot, in this order:
+      #   1. compat's `continuous` base: libc, libthr, libz, libbz2,
+      #      libdevinfo, libprocstat and friends, plus headers (dev/evdev/ for
+      #      the input shim) and /usr/libdata/pkgconfig;
+      #   2. nextbsd-userland's `continuous` artifact: libIOKit,
+      #      CoreFoundation and libdispatch in /usr/lib/system and their
+      #      headers, for the IOKit libudev (nothing else here uses it).
+      # Nothing here links X, so no X artifact is staged. Public reads, so
+      # the built-in token is enough and fork PRs work.
       # build-displayserver-support.sh installs each component into this
       # sysroot's /usr as it goes.
-      - name: Stage sysroot from compat continuous
+      - name: Stage sysroot from compat and userland continuous
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -63,7 +68,13 @@ jobs:
             --repo nextbsd/nextbsd-freebsd-compat \
             --pattern "nextbsd-base-${{ matrix.arch }}.tar.gz" \
             --output /tmp/base.tar.gz --clobber
-          tar -C "$GITHUB_WORKSPACE/sysroot" -xzf /tmp/base.tar.gz
+          gh release download continuous \
+            --repo nextbsd/nextbsd-userland \
+            --pattern "nextbsd-userland-${{ matrix.arch }}.tar.gz" \
+            --output /tmp/userland.tar.gz --clobber
+          for t in base userland; do
+            tar -C "$GITHUB_WORKSPACE/sysroot" -xzf "/tmp/$t.tar.gz"
+          done
 
       - name: Build displayserver-support into /stage
         env:
