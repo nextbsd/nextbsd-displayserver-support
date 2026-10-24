@@ -584,8 +584,8 @@ build_freetype() {
 #   config     /etc/fonts (fonts.conf, conf.d -> /usr/share/fontconfig/conf.avail)
 #   templates  /usr/share/fontconfig/conf.avail
 #   cache      /var/cache/fontconfig; per-user caches stay in ~/.cache/fontconfig
-#   fonts      /System/Library/Fonts, /Library/Fonts, /Network/Library/Fonts,
-#              ~/Library/Fonts (NextBSD's domains, E25 plan), then
+#   fonts      /System/Library/Fonts, /Local/Library/Fonts, /Network/Library/Fonts,
+#              ~/Library/Fonts (NextBSD's domains, as in nextbsd-xlibs), then
 #              /usr/X11/share/fonts (XLibre's fonts)
 # /etc/fonts is built and staged into the sysroot (and printed below) but is
 # not in the artifact: nextbsd-overlays ships it (nextbsd-overlays#26), and an
@@ -603,7 +603,7 @@ build_fontconfig() {
         -Dbaseconfig-dir="$SYSCONFDIR/fonts" \
         -Dtemplate-dir="$PREFIX/share/fontconfig/conf.avail" \
         -Dcache-dir="$LOCALSTATEDIR/cache/fontconfig" \
-        -Ddefault-fonts-dirs=/System/Library/Fonts,/Library/Fonts,/Network/Library/Fonts,~/Library/Fonts \
+        -Ddefault-fonts-dirs=/System/Library/Fonts,/Local/Library/Fonts,/Network/Library/Fonts,~/Library/Fonts \
         -Dadditional-fonts-dirs="$X_PREFIX/share/fonts"
     stage fontconfig
     local x="$DESTDIR$PREFIX" conf="$SYSROOT$SYSCONFDIR/fonts/fonts.conf" d
@@ -611,7 +611,7 @@ build_fontconfig() {
     [ ! -e "$DESTDIR$SYSCONFDIR" ] || fail "$SYSCONFDIR is in the artifact"
     grep -q "<cachedir>$LOCALSTATEDIR/cache/fontconfig</cachedir>" "$conf" \
         || fail "fonts.conf does not name $LOCALSTATEDIR/cache/fontconfig"
-    for d in /System/Library/Fonts /Library/Fonts /Network/Library/Fonts '~/Library/Fonts' "$X_PREFIX/share/fonts"; do
+    for d in /System/Library/Fonts /Local/Library/Fonts /Network/Library/Fonts '~/Library/Fonts' "$X_PREFIX/share/fonts"; do
         grep -q "<dir>$d</dir>" "$conf" || fail "fonts.conf does not name $d"
     done
     if grep -n /usr/local "$conf"; then

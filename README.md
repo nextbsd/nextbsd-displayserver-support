@@ -180,7 +180,7 @@ Built with `-Dbaseconfig-dir=/etc/fonts`, `-Dtemplate-dir=/usr/share/fontconfig/
 `-Dcache-dir=/var/cache/fontconfig` and NextBSD's font domains:
 
 1. `/System/Library/Fonts`
-2. `/Library/Fonts`
+2. `/Local/Library/Fonts`
 3. `/Network/Library/Fonts`
 4. `~/Library/Fonts`
 5. then `/usr/X11/share/fonts` (XLibre's fonts)
