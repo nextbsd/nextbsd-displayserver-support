@@ -1,0 +1,116 @@
+name: Build NextBSD displayserver-support (libraries shared by the display servers)
+
+# Cross-builds the libraries and data both display servers share (E25: libdrm,
+# pixman, expat, freetype, fontconfig, xkeyboard-config, libxkbcommon and the
+# input stack) into /usr for amd64 and arm64 on the x86_64 runner, inside the
+# per-arch nextbsd-kernel-toolchain container, against compat's `continuous`
+# base as the sysroot, from the pinned tarballs in sources.lock. Publishes
+# nextbsd-displayserver-support-<arch>.tar.gz to this repo's `continuous`
+# release on pushes to main and on manual runs from main; pull requests build
+# only.
+#
+# Nothing is dispatched from here and nothing dispatches here: nextbsd-xlibs,
+# nextbsd-mesa, nextbsd-xlibre, nextbsd-gnustep-support and
+# nextbsd-gershwin-support (which build against this artifact) and nextbsd-pkg
+# are run by hand, in order (E25 plan; the rebuild-chain policy: a merge never
+# rebuilds downstream repos).
+
+on:
+  push:
+    branches: [main]
+    paths: ['build-displayserver-support.sh', 'sources.lock', 'patches/**', 'cross/**', '.github/workflows/build.yml']
+  pull_request:
+    paths: ['build-displayserver-support.sh', 'sources.lock', 'patches/**', 'cross/**', '.github/workflows/build.yml']
+  workflow_dispatch:
+    inputs:
+      fbsd_sha:
+        description: 'Pinned FreeBSD SHA for the toolchain image tag (blank = latest)'
+        required: false
+        default: ''
+
+jobs:
+  build:
+    name: displayserver-support (${{ matrix.arch }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: amd64, target_arch: amd64 }
+          - { arch: arm64, target_arch: aarch64 }
+    container:
+      # Per-arch toolchain image: the pinned llvmorg-19.1.7 clang, lld and LLVM
+      # binutils at $CROSS_BINDIR (set by the image), plus meson, ninja, cmake,
+      # pkgconf, autotools, python3, perl and bison (nextbsd-toolchain#13).
+      # Nothing is apt-installed here.
+      image: ghcr.io/nextbsd/nextbsd-kernel-toolchain:${{ matrix.arch }}-${{ inputs.fbsd_sha && format('fbsd-{0}', inputs.fbsd_sha) || 'latest' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Stage the cross sysroot from compat's `continuous` base alone: libc,
+      # libthr, libz, libbz2, libdevinfo, libprocstat and friends, plus headers
+      # (dev/evdev/ for the input shim) and /usr/libdata/pkgconfig. Nothing
+      # here links X, so no other artifact is staged. A public read, so the
+      # built-in token is enough and fork PRs work.
+      # build-displayserver-support.sh installs each component into this
+      # sysroot's /usr as it goes.
+      - name: Stage sysroot from compat continuous
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/sysroot"
+          gh release download continuous \
+            --repo nextbsd/nextbsd-freebsd-compat \
+            --pattern "nextbsd-base-${{ matrix.arch }}.tar.gz" \
+            --output /tmp/base.tar.gz --clobber
+          tar -C "$GITHUB_WORKSPACE/sysroot" -xzf /tmp/base.tar.gz
+
+      - name: Build displayserver-support into /stage
+        env:
+          T: ${{ matrix.arch }}
+          TA: ${{ matrix.target_arch }}
+          SYSROOT: ${{ github.workspace }}/sysroot
+          DESTDIR: /stage
+        run: ./build-displayserver-support.sh
+
+      # Raw tar of /stage rooted at /: everything under /usr, including the
+      # headers, .pc files and .so links that the downstream repos stage into
+      # their sysroots. /etc/fonts is not in it (nextbsd-overlays ships /etc;
+      # the build log prints what it built). Splitting runtime from development
+      # files is nextbsd-pkg's job.
+      - name: Pack displayserver-support artifact
+        run: |
+          tar -C /stage -czf "/tmp/nextbsd-displayserver-support-${{ matrix.arch }}.tar.gz" .
+          tar -tzvf "/tmp/nextbsd-displayserver-support-${{ matrix.arch }}.tar.gz" | grep -v '/$' || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nextbsd-displayserver-support-${{ matrix.arch }}
+          path: /tmp/nextbsd-displayserver-support-${{ matrix.arch }}.tar.gz
+
+  publish:
+    needs: build
+    # Pushes to main and manual runs from main; never pull requests.
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Gather artifacts
+        run: |
+          mkdir -p out
+          find artifacts -name 'nextbsd-displayserver-support-*.tar.gz' -exec cp {} out/ \;
+          ls -la out/
+      - name: Publish to continuous release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: continuous
+          name: Continuous displayserver-support build
+          prerelease: true
+          fail_on_unmatched_files: true
+          files: out/*.tar.gz
+      # That is where this stops: no dispatch to any downstream repo or to
+      # nextbsd-pkg. They are run by hand once this build is known good.

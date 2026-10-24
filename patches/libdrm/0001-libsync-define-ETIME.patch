@@ -1,0 +1,22 @@
+Description: Define ETIME as ETIMEDOUT in libsync.h
+ NextBSD, like FreeBSD, has no ETIME (sys/sys/errno.h has only ETIMEDOUT), so
+ the installed libsync.h's sync_wait() does not compile in a consumer. Mesa
+ does the same in its own copy.
+Origin: nextbsd-ports d3479089952d, graphics/libdrm/files/patch-libsync.h
+ (inherited unchanged from the FreeBSD port graphics/libdrm)
+Forwarded: no
+---
+diff --git a/libsync.h b/libsync.h
+index c6b64ed..cbd75e6 100644
+--- a/libsync.h
++++ b/libsync.h
+@@ -35,6 +35,9 @@
+ #include <sys/ioctl.h>
+ #include <poll.h>
+ #include <unistd.h>
++#ifndef ETIME
++#define ETIME ETIMEDOUT
++#endif
+ 
+ #if defined(__cplusplus)
+ extern "C" {
