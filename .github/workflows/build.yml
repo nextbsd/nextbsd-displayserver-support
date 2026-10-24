@@ -18,9 +18,9 @@ name: Build NextBSD displayserver-support (libraries shared by the display serve
 on:
   push:
     branches: [main]
-    paths: ['build-displayserver-support.sh', 'sources.lock', 'patches/**', 'cross/**', '.github/workflows/build.yml']
+    paths: ['build-displayserver-support.sh', 'sources.lock', 'patches/**', 'cross/**', 'launchd/**', '.github/workflows/build.yml']
   pull_request:
-    paths: ['build-displayserver-support.sh', 'sources.lock', 'patches/**', 'cross/**', '.github/workflows/build.yml']
+    paths: ['build-displayserver-support.sh', 'sources.lock', 'patches/**', 'cross/**', 'launchd/**', '.github/workflows/build.yml']
   workflow_dispatch:
     inputs:
       fbsd_sha:
@@ -75,8 +75,9 @@ jobs:
 
       # Raw tar of /stage rooted at /: everything under /usr, including the
       # headers, .pc files and .so links that the downstream repos stage into
-      # their sysroots. /etc/fonts is not in it (nextbsd-overlays ships /etc;
-      # the build log prints what it built). Splitting runtime from development
+      # their sysroots, and fontconfig's org.nextbsd.fc-cache job in
+      # /System/Library/LaunchDaemons. /etc/fonts is not in it (nextbsd-overlays
+      # ships /etc; the build log prints what it built). Splitting runtime from development
       # files is nextbsd-pkg's job.
       - name: Pack displayserver-support artifact
         run: |

@@ -45,7 +45,8 @@ nextbsd-xlibs. The repo follows
 4. **Everything installs under `/usr`** (E25 D4) with **upstream sonames**, the
    same ones nextbsd-xlibs and nextbsd-xlibre shipped. See [Paths](#paths).
    Nothing goes in `/usr/local` or `/usr/X11`, and the artifact ships nothing
-   in `/etc`: configuration belongs to nextbsd-overlays.
+   in `/etc`: configuration belongs to nextbsd-overlays. The one file outside
+   `/usr` is fontconfig's launchd job, in `/System/Library/LaunchDaemons`.
 5. **Only the NextBSD base sysroot is linked against** (compat's `continuous`
    base), never nextbsd-userland or the X repos. Build tools come from the
    toolchain image (or, for gperf, are built on the runner) and never ship.
@@ -63,6 +64,7 @@ cross/meson/<arch>.ini          meson cross files (host_machine system = 'freebs
 cross/autotools/<arch>.site     autotools CONFIG_SITE files (cross compiler, pkgconf,
 cross/autotools/common.site       cache answers for checks that would run a program)
 cross/cmake/<arch>.cmake        CMake toolchain files (epoll-shim)
+launchd/org.nextbsd.fc-cache.plist  the font-cache launchd job (see [fontconfig](#fontconfig))
 .github/workflows/build.yml     CI: build both arches, publish `continuous`
 NOTICE.md                       per-component provenance and licence
 ```
@@ -144,12 +146,13 @@ build.
 | xkb data | `/usr/share/xkeyboard-config-2`, with `/usr/share/X11/xkb` → `../xkeyboard-config-2` |
 | libxkbcommon | xkb root (and legacy root) `/usr/share/X11/xkb`, extra path `/etc/xkb`, X locale (Compose) root `/usr/X11/share/X11/locale` (libX11's, from nextbsd-xlibs) |
 | libinput | quirks `/usr/share/libinput`, local overrides `/etc/libinput/local-overrides.quirks`; no udev rules |
+| launchd job | `/System/Library/LaunchDaemons/org.nextbsd.fc-cache.plist` (see [fontconfig](#fontconfig)) |
 | `<linux/input.h>` shim | `/usr/include/linux-input-shim/linux/`, through `linux-input-shim.pc` (see [linux-input-shim](#linux-input-shim)) |
 
-The `/etc` files (`/etc/fonts`, `/etc/xkb`, `/etc/libinput`) and the
-`org.nextbsd.fc-cache` launchd job are shipped by nextbsd-overlays
-(nextbsd-overlays#26), which owns `/etc`; this repo only compiles the paths
-in.
+The `/etc` files (`/etc/fonts`; `/etc/xkb` and `/etc/libinput` are optional
+and not shipped) belong to nextbsd-overlays (nextbsd-overlays#26), which owns
+`/etc`; this repo only compiles the paths in. The `org.nextbsd.fc-cache`
+launchd job ships here, next to fc-cache.
 
 ## Components
 
@@ -195,8 +198,31 @@ the whole of `fonts.conf`, so nextbsd-overlays can copy it from there. The
 templates the `conf.d` links point to (`/usr/share/fontconfig/conf.avail`) are
 in the artifact.
 
-fc-cache cannot run on the build host (`cache-build` is off); an
-`org.nextbsd.fc-cache` launchd job builds the cache on the system.
+fc-cache cannot run on the build host (`cache-build` is off). The
+`org.nextbsd.fc-cache` launchd job (`launchd/org.nextbsd.fc-cache.plist`,
+installed in `/System/Library/LaunchDaemons`) builds the cache on the system
+instead of a post-install script. It ships here rather than in
+nextbsd-overlays, as cupsd's job ships with nextbsd-printing-support: it
+belongs with the program it runs, so it is there exactly when fc-cache is and
+`pkg upgrade` updates it.
+
+- **When:** at boot (`RunAtLoad`). `fc-cache -s` scans the system font
+  directories only, skips the missing ones and rewrites only out-of-date
+  caches, so a boot without font changes costs a stat per directory. It runs
+  as root, at `Nice` 10, with no `KeepAlive`.
+- **On font changes:** `WatchPaths` names `/System/Library/Fonts`,
+  `/Local/Library/Fonts` and `/Network/Library/Fonts`. launchctl turns
+  WatchPaths into a `com.apple.fsevents.matching` launch event that nothing on
+  NextBSD delivers yet (nextbsd/nextbsd-userland#243), so for now the cache is
+  refreshed at the next boot or by running `fc-cache -s` by hand.
+- **Where:** `/var/cache/fontconfig`, which fc-cache creates (0755, root) on
+  its first run. Per-user fonts (`~/Library/Fonts`) are cached in
+  `~/.cache/fontconfig` by fontconfig itself.
+- **Silent:** output goes to `/var/log/fc-cache.log`, never the console.
+
+The build checks that the job is well-formed, carries the
+`org.nextbsd.fc-cache` label, runs the staged `/usr/bin/fc-cache` and logs to
+`/var/log`.
 
 ### linux-input-shim
 

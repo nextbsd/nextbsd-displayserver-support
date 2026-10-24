@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  org.nextbsd.fc-cache.plist
+
+  launchd job that builds fontconfig's system font cache in
+  /var/cache/fontconfig, instead of a post-install script. Installed by
+  nextbsd-displayserver-support into /System/Library/LaunchDaemons, next
+  to /usr/bin/fc-cache, so the job is present exactly when fc-cache is
+  (nextbsd-overlays#26).
+
+  - RunAtLoad: runs once at boot. `fc-cache -s` scans only the system
+    font directories in /etc/fonts/fonts.conf (/System/Library/Fonts,
+    /Local/Library/Fonts, /Network/Library/Fonts, /usr/X11/share/fonts)
+    and rewrites only the caches that are out of date, so a boot with no
+    font changes costs one stat per directory. Missing directories are
+    skipped. fc-cache creates /var/cache/fontconfig (0755, root) the
+    first time. Per-user directories (~/Library/Fonts) are cached by
+    fontconfig itself in ~/.cache/fontconfig when an application runs.
+  - WatchPaths: runs again when a font is added to or removed from a
+    NextBSD font domain, as Darwin's launchd jobs watch their inputs.
+    launchctl turns WatchPaths into a com.apple.fsevents.matching
+    LaunchEvent, which nothing on NextBSD delivers yet
+    (nextbsd/nextbsd-userland#243), so today the key is inert and the
+    cache is refreshed at the next boot (or by running `fc-cache -s`).
+    A path that does not exist is simply never matched.
+  - No KeepAlive: fc-cache exits when it is done and a failure is not
+    retried until the next boot or font change.
+  - Nice 10: a cache rebuild never competes with the login window.
+  - Silent: fc-cache's output goes to /var/log/fc-cache.log, never the
+    console.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>org.nextbsd.fc-cache</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/bin/fc-cache</string>
+		<string>-s</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>WatchPaths</key>
+	<array>
+		<string>/System/Library/Fonts</string>
+		<string>/Local/Library/Fonts</string>
+		<string>/Network/Library/Fonts</string>
+	</array>
+	<key>Nice</key>
+	<integer>10</integer>
+	<key>StandardOutPath</key>
+	<string>/var/log/fc-cache.log</string>
+	<key>StandardErrorPath</key>
+	<string>/var/log/fc-cache.log</string>
+</dict>
+</plist>
