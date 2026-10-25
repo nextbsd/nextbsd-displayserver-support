@@ -43,7 +43,7 @@
 #       ships cupsd's
 #
 # EXECUTION CONTEXT (set up by CI before this runs)
-#   Inside the nextbsd-kernel-toolchain container (pinned clang/lld 19.1.7 in
+#   Inside the nextbsd-toolchain container (pinned clang/lld 19.1.7 in
 #   $CROSS_BINDIR, meson, ninja, cmake, pkgconf, autotools, python3, perl,
 #   bison), with compat's `continuous` base and then nextbsd-userland's
 #   `continuous` artifact extracted into $SYSROOT. $SYSROOT
