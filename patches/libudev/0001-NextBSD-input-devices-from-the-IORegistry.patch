@@ -1,0 +1,933 @@
+From: pkgdemon <pkgdemonteam@gmail.com>
+Subject: NextBSD: input devices from the IORegistry (IOHIDDevice entries)
+Origin: NextBSD, nextbsd/nextbsd-displayserver-support#2 (kernel side:
+ nextbsd/nextbsd-kernel#331)
+Forwarded: not-needed
+
+The kernel publishes every /dev/input/eventN as an IOHIDDevice registry
+entry. Enumerate those with IOServiceGetMatchingServices instead of
+scanning devfs for input nodes, and build each evdev udev_device from the
+entry's properties instead of the kern.evdev.input sysctls:
+
+  DEVNAME, devnode, syspath  org.nextbsd.DevNode
+  MAJOR, MINOR, DEVNUM       BSD Major / BSD Minor
+  ID_INPUT, ID_INPUT_*       PrimaryUsagePage / PrimaryUsage
+  ID_VENDOR_ID, ID_MODEL_ID  VendorID / ProductID
+  ID_INTEGRATION             Transport
+  parent (sysname = phys, or "uinput"): NAME and sysattr name from
+  Product, PRODUCT from BusType/VendorID/ProductID/VersionNumber, UNIQ
+  from SerialNumber; the same synthetic parent libudev-devd made.
+
+A node with no entry, or whose usage maps to no udev type (switch-only),
+is classified from the sysctls as before; without /dev/ioregistry devfs
+is scanned as before. Links libIOKit, CoreFoundation and libdispatch
+(nextbsd-userland, /usr/lib/system). udev-iokit.c also holds the IOKit
+watch the monitor uses (next patch).
+
+--- a/meson.build
++++ b/meson.build
+@@ -89,6 +89,22 @@
+ 	config_h.set('HAVE_SYSCTLBYNAME', '1')
+ endif
+ 
++# NextBSD: input devices and hotplug come from the IORegistry through
++# libIOKit (nextbsd-userland), which needs CoreFoundation, and the hotplug
++# callbacks run on a libdispatch queue. These live in /usr/lib/system; the
++# build passes -L for it in c_link_args. CoreFoundation's headers declare
++# blocks, hence -fblocks (no block is used, so no blocks runtime is linked).
++iokit_deps = [
++	cc.find_library('IOKit'),
++	cc.find_library('CoreFoundation'),
++	cc.find_library('system_dispatch'),
++]
++if not cc.has_header('IOKit/IOKitLib.h', args : '-fblocks')
++	error('IOKit/IOKitLib.h not found (stage nextbsd-userland into the sysroot)')
++endif
++config_h.set('HAVE_IOKIT', '1')
++add_project_arguments('-fblocks', language: 'c')
++
+ libudevdevd_so_version = '0.0.0'
+ # Dependencies
+ thread_dep = dependency('threads')
+@@ -107,6 +123,8 @@
+ 	'udev-filter.h',
+ 	'udev-global.h',
+ 	'udev-hwdb.c',
++	'udev-iokit.c',
++	'udev-iokit.h',
+ 	'udev-list.c',
+ 	'udev-list.h',
+ 	'udev-monitor.c',
+@@ -133,7 +151,7 @@
+ 	thread_dep,
+ 	devinfo_dep,
+ 	procstat_dep
+-]
++] + iokit_deps
+ 
+ lib_libudevdevd = shared_library('udev',
+ 	src_libudevdevd,
+--- a/udev-dev.c
++++ b/udev-dev.c
+@@ -56,6 +56,9 @@
+ #endif
+ 
+ #include "udev-global.h"
++#ifdef HAVE_IOKIT
++#include "udev-iokit.h"
++#endif
+ 
+ #ifdef HAVE_LINUX_INPUT_H
+ #ifndef	BTN_DPAD_UP
+@@ -96,15 +99,26 @@
+ 	IT_SWITCH,
+ };
+ 
++struct udev_dev_enumerate_args {
++	struct udev_enumerate *ue;
++	bool skip_evdev;	/* NextBSD: the IORegistry listed them */
++};
++
+ static int
+ udev_dev_enumerate_cb(const char *path, mode_t type, void *arg)
+ {
+-	struct udev_enumerate *ue = arg;
++	struct udev_dev_enumerate_args *args = arg;
+ 	const char *syspath;
+ 
+ 	if (S_ISLNK(type) || S_ISCHR(type)) {
+ 		syspath = get_syspath_by_devpath(path);
+-		return (udev_enumerate_add_device(ue, syspath));
++#ifdef HAVE_IOKIT
++		if (args->skip_evdev && strncmp(syspath,
++		    UDEV_IOKIT_EVDEV_PREFIX,
++		    strlen(UDEV_IOKIT_EVDEV_PREFIX)) == 0)
++			return (0);
++#endif
++		return (udev_enumerate_add_device(args->ue, syspath));
+ 	}
+ 	return (0);
+ }
+@@ -207,10 +221,14 @@
+ udev_dev_enumerate(struct udev_enumerate *ue)
+ {
+ 	char path[DEV_PATH_MAX] = DEV_PATH_ROOT "/";
++	struct udev_dev_enumerate_args args = {
++		.ue = ue,
++		.skip_evdev = false,
++	};
+ 	struct scandir_ctx ctx = {
+ 		.recursive = true,
+ 		.cb = udev_dev_enumerate_cb,
+-		.args = ue,
++		.args = &args,
+ 	};
+ 	int ret;
+ #ifdef HAVE_SYSCTLBYNAME
+@@ -218,6 +236,18 @@
+ 	size_t jailed_len;
+ #endif
+ 
++#ifdef HAVE_IOKIT
++	/*
++	 * NextBSD: input nodes come from the IORegistry's IOHIDDevice
++	 * entries; devfs is scanned for them only if the registry has none
++	 * (or cannot be reached). Everything else (drm, ...) is still found
++	 * in devfs.
++	 */
++	ret = udev_iokit_enumerate(ue);
++	if (ret == -1)
++		return (ret);
++	args.skip_evdev = (ret == 1);
++#endif
+ 	ret = scandir_recursive(path, sizeof(path), &ctx);
+ 	if (ret != 0)
+ 		return (ret);
+@@ -225,7 +255,7 @@
+ 	jailed_len = sizeof(jailed);
+ 	if (sysctlbyname("security.jail.jailed", &jailed, &jailed_len, NULL,
+ 	    0) == 0 && jailed != 0) {
+-		ret = udev_dev_enumerate_evdev_sysctl(ue);
++		ret = args.skip_evdev ? 0 : udev_dev_enumerate_evdev_sysctl(ue);
+ 		if (ret == 0)
+ 			ret = udev_dev_enumerate_drm_sysctl(ue);
+ 	}
+@@ -384,7 +414,18 @@
+ 	const char *unit;
+ 	char mib[32];
+ 	size_t len;
++#endif
+ 
++#ifdef HAVE_IOKIT
++	/*
++	 * NextBSD: the node's IOHIDDevice registry entry. The sysctl and
++	 * ioctl classification below stays as the fallback for a node whose
++	 * usage maps to no udev type (switch-only) or that has no entry.
++	 */
++	if (udev_iokit_create_evdev(ud))
++		return;
++#endif
++#ifdef HAVE_SYSCTLBYNAME
+ 	sysname = _udev_device_get_sysname(ud);
+ 	len = syspathlen_wo_units(sysname);
+ 	unit = sysname + len;
+--- a/udev-iokit.h
++++ b/udev-iokit.h
+@@ -0,0 +1,90 @@
++/*
++ * Copyright (c) 2026, Joseph Maloney
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
++ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
++ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
++ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ */
++
++/*
++ * NextBSD: input devices from the IORegistry.
++ *
++ * The kernel publishes every /dev/input/eventN as an IOHIDDevice registry
++ * entry (nextbsd-kernel#331). This file enumerates those entries, turns
++ * their properties into the udev properties libinput and the X server
++ * read, and watches them with IOKit match/terminate notifications.
++ */
++
++#ifndef UDEV_IOKIT_H_
++#define UDEV_IOKIT_H_
++
++#include <stdbool.h>
++#include <stdint.h>
++
++struct udev_device;
++struct udev_enumerate;
++
++/* Registry class and the devfs prefix of its nodes. */
++#define	UDEV_IOKIT_HID_CLASS	"IOHIDDevice"
++#define	UDEV_IOKIT_EVDEV_PREFIX	DEV_PATH_ROOT "/input/event"
++
++/*
++ * Add the syspath (= devnode, /dev/input/eventN) of every live IOHIDDevice
++ * entry to `ue`. Returns 1 when the registry answered (the devfs scan then
++ * skips /dev/input/event*), 0 when it is not reachable (no /dev/ioregistry:
++ * the devfs scan finds the nodes as before) and -1 on allocation failure.
++ */
++int	udev_iokit_enumerate(struct udev_enumerate *ue);
++
++/*
++ * Fill an evdev udev_device (syspath /dev/input/eventN) from its registry
++ * entry. Returns false if there is no entry, or if its PrimaryUsage maps to
++ * no ID_INPUT_* type; the caller then classifies the node from the
++ * kern.evdev.input sysctls as libudev-devd always did.
++ */
++bool	udev_iokit_create_evdev(struct udev_device *ud);
++
++/*
++ * Hotplug. The callback runs on a private serial dispatch queue (never on
++ * the caller's thread) with the syspath of an input node that appeared
++ * (UD_ACTION_ADD) or went away (UD_ACTION_REMOVE).
++ */
++typedef void	udev_iokit_event_fn(void *arg, const char *syspath,
++		    int action);
++
++struct udev_iokit_watch;
++
++/*
++ * Start watching IOHIDDevice entries; `fn` gets one call per hotplug event,
++ * serialised. The entries present now are remembered (so that their removal
++ * is reported) but not reported as added: the caller enumerates them.
++ * Returns NULL if the registry is not reachable or on allocation failure.
++ */
++struct udev_iokit_watch *udev_iokit_watch_start(udev_iokit_event_fn *fn,
++	    void *arg);
++
++/*
++ * Stop the watch. No call of `fn` starts after this returns, and one that
++ * was running has finished, so `arg` may be freed at once. The watch's own
++ * memory goes when the last queued notification has drained.
++ */
++void	udev_iokit_watch_stop(struct udev_iokit_watch *w);
++
++#endif /* UDEV_IOKIT_H_ */
+--- a/udev-iokit.c
++++ b/udev-iokit.c
+@@ -0,0 +1,664 @@
++/*
++ * Copyright (c) 2026, Joseph Maloney
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
++ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
++ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
++ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ */
++
++/*
++ * NextBSD: input devices from the IORegistry (nextbsd-kernel#331).
++ *
++ * Each /dev/input/eventN is an IOHIDDevice registry entry named eventN.
++ * Its keys (Apple's IOHIDDevice and IOBSD keys plus org.nextbsd.*) map to
++ * udev as follows:
++ *
++ *   syspath, devnode, DEVNAME   org.nextbsd.DevNode (/dev/input/eventN)
++ *   MAJOR, MINOR, devnum        BSD Major, BSD Minor
++ *   ID_INPUT, ID_INPUT_*        PrimaryUsagePage / PrimaryUsage (usage_tags)
++ *   ID_VENDOR_ID, ID_MODEL_ID   VendorID, ProductID (%04x)
++ *   ID_INTEGRATION              Transport: I2C, SPI, PS2 internal;
++ *                               USB, Bluetooth external
++ *   parent sysname              org.nextbsd.evdev.Phys (the driver's
++ *                               nameunit, e.g. hms0), "uinput" if empty
++ *   parent NAME, sysattr name   Product, cut at the first comma
++ *   parent PRODUCT              org.nextbsd.evdev.BusType/VendorID/
++ *                               ProductID/VersionNumber (%x/%x/%x/%x)
++ *   parent UNIQ                 SerialNumber
++ *
++ * That is the shape libudev-devd built from the kern.evdev.input sysctls
++ * (a device plus a synthetic parent that carries the name and ids), so
++ * libinput's quirks and the X server's config/udev.c read the same values.
++ * The kernel derives PrimaryUsage from the HID top-level collection, or for
++ * non-HID nodes from libudev-devd's own classification of the capability
++ * bits, so devices keep the type they had.
++ *
++ * Hotplug comes from IOServiceAddMatchingNotification (first-match and
++ * terminated) on a private serial dispatch queue; see udev-monitor.c for
++ * the pollable fd it feeds.
++ */
++
++#include "config.h"
++
++#include <sys/types.h>
++#include <sys/stat.h>
++
++#include <inttypes.h>
++#include <pthread.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include <CoreFoundation/CoreFoundation.h>
++#include <IOKit/IOKitLib.h>
++#include <dispatch/dispatch.h>
++
++#include "udev-global.h"
++#include "udev-iokit.h"
++
++#define	IOKIT_PROP_MAX	256
++
++/* ---- registry properties ------------------------------------------------ */
++
++static CFTypeRef
++prop_get(CFDictionaryRef props, const char *key)
++{
++	CFStringRef k;
++	CFTypeRef v;
++
++	k = CFStringCreateWithCString(kCFAllocatorDefault, key,
++	    kCFStringEncodingUTF8);
++	if (k == NULL)
++		return (NULL);
++	v = CFDictionaryGetValue(props, k);
++	CFRelease(k);
++	return (v);
++}
++
++static bool
++prop_string(CFDictionaryRef props, const char *key, char *buf, size_t len)
++{
++	CFTypeRef v;
++
++	buf[0] = '\0';
++	v = prop_get(props, key);
++	if (v == NULL || CFGetTypeID(v) != CFStringGetTypeID())
++		return (false);
++	if (!CFStringGetCString((CFStringRef)v, buf, (CFIndex)len,
++	    kCFStringEncodingUTF8)) {
++		buf[0] = '\0';
++		return (false);
++	}
++	return (true);
++}
++
++static bool
++prop_number(CFDictionaryRef props, const char *key, int64_t *out)
++{
++	CFTypeRef v;
++
++	v = prop_get(props, key);
++	if (v == NULL || CFGetTypeID(v) != CFNumberGetTypeID())
++		return (false);
++	return (CFNumberGetValue((CFNumberRef)v, kCFNumberSInt64Type, out));
++}
++
++/* An entry's property bag, or NULL (gone for good, or no registry). */
++static CFMutableDictionaryRef
++entry_props(io_registry_entry_t entry)
++{
++	CFMutableDictionaryRef props = NULL;
++
++	if (IORegistryEntryCreateCFProperties(entry, &props,
++	    kCFAllocatorDefault, 0) != KERN_SUCCESS)
++		return (NULL);
++	return (props);
++}
++
++/* The devnode of an IOHIDDevice entry's properties, if it is an evdev node. */
++static bool
++props_devnode(CFDictionaryRef props, char *buf, size_t len)
++{
++
++	return (prop_string(props, "org.nextbsd.DevNode", buf, len) &&
++	    strncmp(buf, UDEV_IOKIT_EVDEV_PREFIX,
++	    strlen(UDEV_IOKIT_EVDEV_PREFIX)) == 0);
++}
++
++static CFMutableDictionaryRef
++hid_matching(const char *name)
++{
++	CFMutableDictionaryRef matching;
++	CFStringRef n;
++
++	matching = IOServiceMatching(UDEV_IOKIT_HID_CLASS);
++	if (matching == NULL || name == NULL)
++		return (matching);
++	n = CFStringCreateWithCString(kCFAllocatorDefault, name,
++	    kCFStringEncodingUTF8);
++	if (n == NULL) {
++		CFRelease(matching);
++		return (NULL);
++	}
++	CFDictionarySetValue(matching, CFSTR(kIONameMatchKey), n);
++	CFRelease(n);
++	return (matching);
++}
++
++/*
++ * The properties of the live IOHIDDevice entry for `syspath`
++ * (/dev/input/eventN), found by its registry name eventN.
++ */
++static CFMutableDictionaryRef
++hid_props_for_syspath(const char *syspath)
++{
++	CFMutableDictionaryRef matching, props, found = NULL;
++	io_iterator_t it;
++	io_registry_entry_t e;
++	char devnode[IOKIT_PROP_MAX];
++	const char *sysname;
++	int64_t state;
++
++	if (strncmp(syspath, UDEV_IOKIT_EVDEV_PREFIX,
++	    strlen(UDEV_IOKIT_EVDEV_PREFIX)) != 0)
++		return (NULL);
++	sysname = strbase(syspath);
++	if (sysname == NULL)
++		return (NULL);
++	matching = hid_matching(sysname);
++	if (matching == NULL)
++		return (NULL);
++	/* Consumes `matching`. */
++	if (IOServiceGetMatchingServices(kIOMainPortDefault, matching, &it) !=
++	    KERN_SUCCESS)
++		return (NULL);
++	while (found == NULL && (e = IOIteratorNext(it)) != IO_OBJECT_NULL) {
++		props = entry_props(e);
++		IOObjectRelease(e);
++		if (props == NULL)
++			continue;
++		if (props_devnode(props, devnode, sizeof(devnode)) &&
++		    strcmp(devnode, syspath) == 0 &&
++		    (!prop_number(props, "state", &state) || state == 0))
++			found = props;
++		else
++			CFRelease(props);
++	}
++	IOObjectRelease(it);
++	return (found);
++}
++
++/* ---- enumeration --------------------------------------------------------- */
++
++int
++udev_iokit_enumerate(struct udev_enumerate *ue)
++{
++	CFMutableDictionaryRef matching, props;
++	io_iterator_t it;
++	io_registry_entry_t e;
++	char devnode[IOKIT_PROP_MAX];
++	int ret = 0, n = 0;
++
++	matching = hid_matching(NULL);
++	if (matching == NULL)
++		return (0);
++	if (IOServiceGetMatchingServices(kIOMainPortDefault, matching, &it) !=
++	    KERN_SUCCESS)
++		return (0);		/* no /dev/ioregistry: scan devfs */
++	while (ret == 0 && (e = IOIteratorNext(it)) != IO_OBJECT_NULL) {
++		props = entry_props(e);
++		IOObjectRelease(e);
++		if (props == NULL)
++			continue;
++		if (props_devnode(props, devnode, sizeof(devnode))) {
++			n++;
++			if (udev_enumerate_add_device(ue, devnode) == -1)
++				ret = -1;
++		}
++		CFRelease(props);
++	}
++	IOObjectRelease(it);
++	if (ret == -1)
++		return (-1);
++	/*
++	 * No entries at all: a kernel without the HID bridge (or a machine
++	 * with no input nodes). Let the devfs scan look, as before.
++	 */
++	return (n > 0 ? 1 : 0);
++}
++
++/* ---- per-device properties ----------------------------------------------- */
++
++/*
++ * The ID_INPUT_* tags for a HID primary usage (the table agreed on
++ * nextbsd-kernel#331). NULL for a usage with no udev type: the caller then
++ * falls back to the capability bits, which also cover switch-only nodes.
++ */
++static const char *const *
++usage_tags(int64_t page, int64_t usage)
++{
++	static const char *const keyboard[] =
++	    { "ID_INPUT_KEY", "ID_INPUT_KEYBOARD", NULL };
++	static const char *const key[] = { "ID_INPUT_KEY", NULL };
++	static const char *const mouse[] = { "ID_INPUT_MOUSE", NULL };
++	static const char *const joystick[] = { "ID_INPUT_JOYSTICK", NULL };
++	static const char *const touchpad[] =
++	    { "ID_INPUT_MOUSE", "ID_INPUT_TOUCHPAD", NULL };
++	static const char *const touchscreen[] =
++	    { "ID_INPUT_TOUCHSCREEN", NULL };
++	static const char *const tablet[] = { "ID_INPUT_TABLET", NULL };
++	static const char *const accel[] = { "ID_INPUT_ACCELEROMETER", NULL };
++
++	switch (page) {
++	case 0x01:			/* Generic Desktop */
++		switch (usage) {
++		case 0x06:		/* Keyboard */
++			return (keyboard);
++		case 0x07:		/* Keypad */
++		case 0x80:		/* System Control */
++			return (key);
++		case 0x01:		/* Pointer */
++		case 0x02:		/* Mouse */
++			return (mouse);
++		case 0x04:		/* Joystick */
++		case 0x05:		/* Game Pad */
++			return (joystick);
++		}
++		break;
++	case 0x0c:			/* Consumer */
++		if (usage == 0x01)	/* Consumer Control */
++			return (key);
++		break;
++	case 0x0d:			/* Digitizers */
++		switch (usage) {
++		case 0x01:		/* Digitizer */
++		case 0x02:		/* Pen */
++			return (tablet);
++		case 0x04:		/* Touch Screen */
++			return (touchscreen);
++		case 0x05:		/* Touch Pad */
++			return (touchpad);
++		}
++		break;
++	case 0x20:			/* Sensors */
++		if (usage == 0x73)	/* Motion: Accelerometer 3D */
++			return (accel);
++		break;
++	}
++	return (NULL);
++}
++
++/* udev's ID_INTEGRATION for a kIOHIDTransportKey value, or NULL. */
++static const char *
++transport_integration(const char *transport)
++{
++
++	if (strcmp(transport, "I2C") == 0 || strcmp(transport, "SPI") == 0 ||
++	    strcmp(transport, "PS2") == 0)
++		return ("internal");
++	if (strcmp(transport, "USB") == 0 ||
++	    strcmp(transport, "Bluetooth") == 0)
++		return ("external");
++	return (NULL);
++}
++
++bool
++udev_iokit_create_evdev(struct udev_device *ud)
++{
++	CFMutableDictionaryRef props;
++	const char *const *tags;
++	struct udev_device *parent;
++	struct udev_list *ul, *pl;
++	const char *integration;
++	char devnode[IOKIT_PROP_MAX], name[IOKIT_PROP_MAX];
++	char phys[IOKIT_PROP_MAX], serial[IOKIT_PROP_MAX];
++	char transport[IOKIT_PROP_MAX];
++	int64_t page, usage, major, minor;
++	int64_t bus = 0, vendor = 0, product = 0, version = 0;
++
++	props = hid_props_for_syspath(_udev_device_get_syspath(ud));
++	if (props == NULL)
++		return (false);
++	if (!prop_number(props, "PrimaryUsagePage", &page) ||
++	    !prop_number(props, "PrimaryUsage", &usage) ||
++	    (tags = usage_tags(page, usage)) == NULL) {
++		CFRelease(props);
++		return (false);
++	}
++
++	ul = udev_device_get_properties_list(ud);
++	udev_list_insert(ul, "ID_INPUT", "1");
++	for (; *tags != NULL; tags++)
++		udev_list_insert(ul, *tags, "1");
++
++	if (props_devnode(props, devnode, sizeof(devnode)))
++		udev_list_insert(ul, "DEVNAME", devnode);
++	if (prop_number(props, "BSD Major", &major) &&
++	    prop_number(props, "BSD Minor", &minor)) {
++		/*
++		 * libinput compares this with fstat()'s st_rdev
++		 * (udev_device_get_devnum reads DEVNUM, as for the sysctl).
++		 */
++		udev_list_insertf(ul, "MAJOR", "%" PRId64, major);
++		udev_list_insertf(ul, "MINOR", "%" PRId64, minor);
++		udev_list_insertf(ul, "DEVNUM", "%" PRIu64,
++		    (uint64_t)makedev((int)major, (int)minor));
++	}
++
++	(void)prop_number(props, "org.nextbsd.evdev.BusType", &bus);
++	(void)prop_number(props, "VendorID", &vendor);
++	(void)prop_number(props, "ProductID", &product);
++	(void)prop_number(props, "VersionNumber", &version);
++	udev_list_insertf(ul, "ID_VENDOR_ID", "%04" PRIx64, vendor);
++	udev_list_insertf(ul, "ID_MODEL_ID", "%04" PRIx64, product);
++	if (prop_string(props, "Transport", transport, sizeof(transport)) &&
++	    (integration = transport_integration(transport)) != NULL)
++		udev_list_insert(ul, "ID_INTEGRATION", integration);
++
++	/*
++	 * The X server and libinput's quirks read the name and ids from the
++	 * parent, as libudev-devd's synthetic parent carried them.
++	 */
++	if (!prop_string(props, "org.nextbsd.evdev.Phys", phys, sizeof(phys)) ||
++	    phys[0] == '\0')
++		strlcpy(phys, "uinput", sizeof(phys));
++	(void)prop_string(props, "Product", name, sizeof(name));
++	*(strchrnul(name, ',')) = '\0';
++	(void)prop_string(props, "SerialNumber", serial, sizeof(serial));
++	CFRelease(props);
++
++	parent = udev_device_new_common(udev_device_get_udev(ud), phys,
++	    UD_ACTION_NONE);
++	if (parent == NULL)
++		return (true);
++	pl = udev_device_get_properties_list(parent);
++	udev_list_insert(pl, "NAME", name);
++	udev_list_insert(udev_device_get_sysattr_list(parent), "name", name);
++	udev_list_insertf(pl, "PRODUCT", "%" PRIx64 "/%" PRIx64 "/%" PRIx64
++	    "/%" PRIx64, bus, vendor, product, version);
++	if (serial[0] != '\0')
++		udev_list_insert(pl, "UNIQ", serial);
++	udev_device_set_parent(ud, parent);
++	return (true);
++}
++
++/* ---- hotplug -------------------------------------------------------------- */
++
++/*
++ * Registry id -> syspath of every input node seen, so a terminated entry is
++ * reported with the syspath its add had. Ids are never reused.
++ */
++struct iokit_cache_ent {
++	struct iokit_cache_ent	*next;
++	int64_t			 id;
++	char			 syspath[];
++};
++
++struct udev_iokit_watch {
++	pthread_mutex_t		 lock;	/* dead, cache; held across fn() */
++	bool			 dead;
++	udev_iokit_event_fn	*fn;
++	void			*arg;
++	dispatch_queue_t	 queue;
++	IONotificationPortRef	 port;
++	struct iokit_cache_ent	*cache;
++};
++
++/* 1 if added, 0 if `id` was already known, -1 on allocation failure. */
++static int
++cache_add(struct udev_iokit_watch *w, int64_t id, const char *syspath)
++{
++	struct iokit_cache_ent *c;
++	size_t len;
++
++	for (c = w->cache; c != NULL; c = c->next)
++		if (c->id == id)
++			return (0);
++	len = strlen(syspath) + 1;
++	c = malloc(sizeof(*c) + len);
++	if (c == NULL)
++		return (-1);
++	c->id = id;
++	memcpy(c->syspath, syspath, len);
++	c->next = w->cache;
++	w->cache = c;
++	return (1);
++}
++
++/* Remove `id`, copying its syspath out. False if it was not cached. */
++static bool
++cache_take(struct udev_iokit_watch *w, int64_t id, char *buf, size_t len)
++{
++	struct iokit_cache_ent **pp, *c;
++
++	for (pp = &w->cache; (c = *pp) != NULL; pp = &c->next) {
++		if (c->id != id)
++			continue;
++		strlcpy(buf, c->syspath, len);
++		*pp = c->next;
++		free(c);
++		return (true);
++	}
++	return (false);
++}
++
++/* An entry's registry id and devnode; false unless both are readable. */
++static bool
++entry_identity(io_registry_entry_t e, int64_t *id, char *devnode, size_t len)
++{
++	CFMutableDictionaryRef props;
++	bool ok;
++
++	props = entry_props(e);
++	if (props == NULL)
++		return (false);
++	ok = prop_number(props, "id", id) &&
++	    props_devnode(props, devnode, len);
++	CFRelease(props);
++	return (ok);
++}
++
++/* Remember the entries already present; they are not reported as added. */
++static void
++watch_seed(struct udev_iokit_watch *w, io_iterator_t it)
++{
++	io_registry_entry_t e;
++	char devnode[IOKIT_PROP_MAX];
++	int64_t id;
++
++	while ((e = IOIteratorNext(it)) != IO_OBJECT_NULL) {
++		if (entry_identity(e, &id, devnode, sizeof(devnode))) {
++			pthread_mutex_lock(&w->lock);
++			(void)cache_add(w, id, devnode);
++			pthread_mutex_unlock(&w->lock);
++		}
++		IOObjectRelease(e);
++	}
++}
++
++/* Drain an iterator without looking at it (the terminated arming one). */
++static void
++drain(io_iterator_t it)
++{
++	io_registry_entry_t e;
++
++	while ((e = IOIteratorNext(it)) != IO_OBJECT_NULL)
++		IOObjectRelease(e);
++}
++
++/* kIOFirstMatchNotification callback, on w->queue. */
++static void
++watch_matched(void *refcon, io_iterator_t it)
++{
++	struct udev_iokit_watch *w = refcon;
++	io_registry_entry_t e;
++	char devnode[IOKIT_PROP_MAX];
++	int64_t id;
++	bool ok;
++
++	while ((e = IOIteratorNext(it)) != IO_OBJECT_NULL) {
++		ok = entry_identity(e, &id, devnode, sizeof(devnode));
++		IOObjectRelease(e);
++		if (!ok)
++			continue;	/* already gone again */
++		pthread_mutex_lock(&w->lock);
++		/*
++		 * A node that arrived while the watch was being armed shows
++		 * up both in the arming iterator and here: report it once.
++		 */
++		if (!w->dead && cache_add(w, id, devnode) == 1)
++			w->fn(w->arg, devnode, UD_ACTION_ADD);
++		pthread_mutex_unlock(&w->lock);
++	}
++}
++
++/* kIOTerminatedNotification callback, on w->queue. */
++static void
++watch_terminated(void *refcon, io_iterator_t it)
++{
++	struct udev_iokit_watch *w = refcon;
++	io_registry_entry_t e;
++	CFMutableDictionaryRef props;
++	char devnode[IOKIT_PROP_MAX], syspath[IOKIT_PROP_MAX];
++	io_name_t name;
++	int64_t id;
++	bool have_id;
++
++	while ((e = IOIteratorNext(it)) != IO_OBJECT_NULL) {
++		/*
++		 * A terminated entry stays readable while it lingers
++		 * (nextbsd-kernel#339), so normally both its id and devnode
++		 * are there. The cache supplies the syspath the add used.
++		 */
++		have_id = false;
++		devnode[0] = '\0';
++		props = entry_props(e);
++		if (props != NULL) {
++			have_id = prop_number(props, "id", &id);
++			(void)props_devnode(props, devnode, sizeof(devnode));
++			CFRelease(props);
++		} else if (IORegistryEntryGetName(e, name) == KERN_SUCCESS &&
++		    strncmp(name, "event", 5) == 0) {
++			snprintf(devnode, sizeof(devnode), "%s/input/%s",
++			    DEV_PATH_ROOT, name);
++		}
++		IOObjectRelease(e);
++
++		pthread_mutex_lock(&w->lock);
++		if (!w->dead) {
++			if (have_id &&
++			    cache_take(w, id, syspath, sizeof(syspath)))
++				w->fn(w->arg, syspath, UD_ACTION_REMOVE);
++			else if (devnode[0] != '\0')
++				w->fn(w->arg, devnode, UD_ACTION_REMOVE);
++		}
++		pthread_mutex_unlock(&w->lock);
++	}
++}
++
++/* w->queue's finalizer: no notification can reach `w` any more. */
++static void
++watch_free(void *ctx)
++{
++	struct udev_iokit_watch *w = ctx;
++	struct iokit_cache_ent *c;
++
++	while ((c = w->cache) != NULL) {
++		w->cache = c->next;
++		free(c);
++	}
++	pthread_mutex_destroy(&w->lock);
++	free(w);
++}
++
++struct udev_iokit_watch *
++udev_iokit_watch_start(udev_iokit_event_fn *fn, void *arg)
++{
++	struct udev_iokit_watch *w;
++	CFMutableDictionaryRef matching;
++	io_iterator_t it;
++
++	w = calloc(1, sizeof(*w));
++	if (w == NULL)
++		return (NULL);
++	pthread_mutex_init(&w->lock, NULL);
++	w->fn = fn;
++	w->arg = arg;
++	w->queue = dispatch_queue_create("org.nextbsd.libudev.iokit", NULL);
++	if (w->queue == NULL) {
++		pthread_mutex_destroy(&w->lock);
++		free(w);
++		return (NULL);
++	}
++	/* From here on `w` is freed by the queue's finalizer. */
++	dispatch_set_context(w->queue, w);
++	dispatch_set_finalizer_f(w->queue, watch_free);
++
++	w->port = IONotificationPortCreate(kIOMainPortDefault);
++	if (w->port == NULL)
++		goto fail;
++	IONotificationPortSetDispatchQueue(w->port, w->queue);
++
++	/* Each call consumes its matching dictionary. */
++	matching = hid_matching(NULL);
++	if (matching == NULL ||
++	    IOServiceAddMatchingNotification(w->port, kIOFirstMatchNotification,
++	    matching, watch_matched, w, &it) != KERN_SUCCESS)
++		goto fail;
++	watch_seed(w, it);
++	IOObjectRelease(it);
++
++	matching = hid_matching(NULL);
++	if (matching == NULL ||
++	    IOServiceAddMatchingNotification(w->port, kIOTerminatedNotification,
++	    matching, watch_terminated, w, &it) != KERN_SUCCESS)
++		goto fail;
++	drain(it);
++	IOObjectRelease(it);
++	return (w);
++
++fail:
++	udev_iokit_watch_stop(w);
++	return (NULL);
++}
++
++void
++udev_iokit_watch_stop(struct udev_iokit_watch *w)
++{
++	dispatch_queue_t q;
++
++	if (w == NULL)
++		return;
++	/* Waits for a callback that is inside fn(). */
++	pthread_mutex_lock(&w->lock);
++	w->dead = true;
++	pthread_mutex_unlock(&w->lock);
++	/*
++	 * libIOKit tears the port down asynchronously and then drops its
++	 * reference to the queue; queued callbacks hold theirs. The last one
++	 * runs watch_free().
++	 */
++	if (w->port != NULL)
++		IONotificationPortDestroy(w->port);
++	q = w->queue;
++	dispatch_release(q);
++}

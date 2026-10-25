@@ -1,0 +1,3 @@
+# NextBSD: the IOKit device source and monitor (Origin: NextBSD).
+0001-NextBSD-input-devices-from-the-IORegistry.patch
+0002-NextBSD-udev-monitor-on-IOKit-notifications.patch

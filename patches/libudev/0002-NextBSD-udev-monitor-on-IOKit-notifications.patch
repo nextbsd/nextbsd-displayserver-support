@@ -1,0 +1,396 @@
+From: pkgdemon <pkgdemonteam@gmail.com>
+Subject: NextBSD: udev_monitor on IOKit notifications instead of devd
+Origin: NextBSD, nextbsd/nextbsd-displayserver-support#2
+Forwarded: not-needed
+
+NextBSD has no devd. Replace the monitor's devd reader thread with IOKit
+first-match and terminated notifications on IOHIDDevice entries
+(udev_iokit_watch, previous patch), delivered on a private serial
+dispatch queue. Each event is queued as (syspath, action) and one byte is
+written to the monitor's pipe, whose read end stays the pollable monitor
+fd; udev_monitor_receive_device() builds the device and applies the
+filters on the caller's thread. Removal is reported with the syspath the
+add used (registry id -> syspath cache); entries present when the
+monitor starts are remembered, not reported. The watch starts only for
+monitors that can take "input" devices. No devd socket is opened.
+
+--- a/udev-filter.c
++++ b/udev-filter.c
+@@ -258,4 +258,22 @@
+ 
+ 	/* Not empty, matched nothing */
+ 	return false;
++}
++
++/*
++ * NextBSD: could a device of @p subsystem pass these filters? True when no
++ * positive subsystem filter is set (only tags, properties, ...), else as
++ * udev_filter_match_subsystem(). Used to start the IOKit input watch only
++ * for monitors that can receive input devices.
++ */
++bool
++udev_filter_wants_subsystem(struct udev_filter_head *ufh, const char *subsystem)
++{
++	struct udev_filter_entry *ufe;
++
++	STAILQ_FOREACH(ufe, ufh, next) {
++		if (ufe->type == UDEV_FILTER_TYPE_SUBSYSTEM && ufe->neg == 0)
++			return (udev_filter_match_subsystem(ufh, subsystem));
++	}
++	return (true);
+ }
+--- a/udev-filter.h
++++ b/udev-filter.h
+@@ -43,6 +43,8 @@
+ void udev_filter_init(struct udev_filter_head *ufh);
+ bool udev_filter_match_subsystem(struct udev_filter_head *ufh,
+     const char *subsystem);
++bool udev_filter_wants_subsystem(struct udev_filter_head *ufh,
++    const char *subsystem);
+ bool udev_filter_match(struct udev *udev, struct udev_filter_head *ufh,
+     const char *syspath);
+ int udev_filter_add(struct udev_filter_head *ufh, int type, int neg,
+--- a/udev-monitor.c
++++ b/udev-monitor.c
+@@ -1,5 +1,6 @@
+ /*
+  * Copyright (c) 2015, 2021 Vladimir Kondratyev <vladimir@kondratyev.su>
++ * Copyright (c) 2026, Joseph Maloney (NextBSD: the IOKit monitor)
+  *
+  * Redistribution and use in source and binary forms, with or without
+  * modification, are permitted provided that the following conditions
+@@ -23,30 +24,45 @@
+  * SUCH DAMAGE.
+  */
+ 
++
++/*
++ * NextBSD: the monitor follows IOHIDDevice entries in the IORegistry
++ * (udev-iokit.c) instead of reading devd's socket; NextBSD has no devd.
++ *
++ * Same shape as libudev-devd's: a pipe whose read end is the monitor fd
++ * (pollable with poll, kqueue or epoll-shim, which is what libinput and the
++ * X server need) and a producer that queues one event and writes one byte
++ * per hotplug. The producer is libIOKit's notification callback on a
++ * private serial dispatch queue rather than a devd reader thread. It
++ * queues only a syspath and an action; the udev_device is built, and the
++ * monitor's filters applied, in udev_monitor_receive_device() on the
++ * caller's thread, so no libudev object is touched off that thread.
++ *
++ * Only input nodes have hotplug events. DRM connector hotplug needs an
++ * IOKit interest notification first (nextbsd-kernel#338); until then a
++ * monitor for "drm" alone is never readable, as before.
++ */
++
+ #include "udev-global.h"
++#include "udev-iokit.h"
+ 
+ #include <sys/types.h>
+ #include <sys/queue.h>
+-#include <sys/socket.h>
+-#include <sys/un.h>
+ 
+ #include <errno.h>
+ #include <fcntl.h>
+-#include <poll.h>
+ #include <pthread.h>
+-#include <signal.h>
++#include <stdbool.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <unistd.h>
+ 
+-#define	DEVD_SOCK_PATH		"/var/run/devd.seqpacket.pipe"
+-#define	DEVD_RECONNECT_INTERVAL	1000	/* reconnect after 1 second */
+-
+ STAILQ_HEAD(udev_monitor_queue_head, udev_monitor_queue_entry);
+ struct udev_monitor_queue_entry {
+-	struct udev_device *ud;
+ 	STAILQ_ENTRY(udev_monitor_queue_entry) next;
++	int action;
++	char syspath[];
+ };
+ 
+ struct udev_monitor {
+@@ -54,177 +70,71 @@
+ 	int fds[2];
+ 	struct udev_filter_head filters;
+ 	struct udev *udev;
+-	struct udev_monitor_queue_head queue;
++	struct udev_monitor_queue_head queue;	/* under mtx */
+ 	pthread_mutex_t mtx;
+-	pthread_t thread;
++	struct udev_iokit_watch *watch;
++	bool receiving;
+ };
+ 
+-static int
+-udev_monitor_set_fd_nonblock(int fd)
+-{
+-	int flags;
+-
+-	flags = fcntl(fd, F_GETFL);
+-	if (flags == -1)
+-		return (-1);
+-	if ((flags & O_NONBLOCK) != 0)
+-		return (0);
+-
+-	return (fcntl(fd, F_SETFL, flags | O_NONBLOCK));
+-}
+-
+ LIBUDEV_EXPORT struct udev_device *
+ udev_monitor_receive_device(struct udev_monitor *um)
+ {
+ 	struct udev_monitor_queue_entry *umqe;
+ 	struct udev_device *ud;
+ 	char buf[1];
++	bool match;
+ 
+ 	TRC("(%p)", um);
+-	if (read(um->fds[0], buf, 1) < 0)
+-		return (NULL);
++	/* One byte per queued event; the fd is non-blocking. */
++	while (read(um->fds[0], buf, 1) == 1) {
++		pthread_mutex_lock(&um->mtx);
++		umqe = STAILQ_FIRST(&um->queue);
++		if (umqe != NULL)
++			STAILQ_REMOVE_HEAD(&um->queue, next);
++		pthread_mutex_unlock(&um->mtx);
++		if (umqe == NULL)
++			continue;
+ 
+-	if (STAILQ_EMPTY(&um->queue))
+-		return (NULL);
+-
+-	pthread_mutex_lock(&um->mtx);
+-	umqe = STAILQ_FIRST(&um->queue);
+-	STAILQ_REMOVE_HEAD(&um->queue, next);
+-	pthread_mutex_unlock(&um->mtx);
+-	ud = umqe->ud;
+-	free(umqe);
+-
+-	return (ud);
++		ud = udev_device_new_common(um->udev, umqe->syspath,
++		    umqe->action);
++		match = ud != NULL &&
++		    udev_filter_match(um->udev, &um->filters, umqe->syspath);
++		free(umqe);
++		if (match)
++			return (ud);
++		udev_device_unref(ud);
++	}
++	return (NULL);
+ }
+ 
+-static int
+-udev_monitor_send_device(struct udev_monitor *um, const char *syspath,
+-    int action)
++/* udev_iokit_event_fn: runs on the IOKit watch's dispatch queue. */
++static void
++udev_monitor_iokit_event(void *arg, const char *syspath, int action)
+ {
++	struct udev_monitor *um = arg;
+ 	struct udev_monitor_queue_entry *umqe;
++	size_t len;
+ 
+-	umqe = calloc(1, sizeof(struct udev_monitor_queue_entry));
++	len = strlen(syspath) + 1;
++	umqe = calloc(1, sizeof(*umqe) + len);
+ 	if (umqe == NULL)
+-		return (-1);
++		return;
++	umqe->action = action;
++	memcpy(umqe->syspath, syspath, len);
+ 
+-	umqe->ud = udev_device_new_common(um->udev, syspath, action);
+-	if (umqe->ud == NULL) {
+-		free(umqe);
+-		return (-1);
+-	}
+-
+ 	pthread_mutex_lock(&um->mtx);
+ 	STAILQ_INSERT_TAIL(&um->queue, umqe, next);
+-	pthread_mutex_unlock(&um->mtx);
+-
++	/*
++	 * Non-blocking: if the reader has let the pipe fill up, drop the
++	 * event rather than stall the queue.
++	 */
+ 	if (write(um->fds[1], "*", 1) != 1) {
+-		pthread_mutex_lock(&um->mtx);
+ 		STAILQ_REMOVE(&um->queue, umqe, udev_monitor_queue_entry, next);
+-		pthread_mutex_unlock(&um->mtx);
+-		udev_device_unref(umqe->ud);
+ 		free(umqe);
+-		return (-1);
+ 	}
+-
+-	return (0);
+-}
+-
+-static int
+-parse_devd_message(char *msg, char *syspath, size_t syspathlen)
+-{
+-	int action;
+-
+-	action = udev_dev_monitor(msg, syspath, syspathlen);
+-	if (action == UD_ACTION_NONE)
+-		action = udev_sys_monitor(msg, syspath, syspathlen);
+-	if (action == UD_ACTION_NONE)
+-		action = udev_pci_monitor(msg, syspath, syspathlen);
+-	if (action == UD_ACTION_NONE)
+-		action = udev_net_monitor(msg, syspath, syspathlen);
+-
+-	return (action);
++	pthread_mutex_unlock(&um->mtx);
+ }
+ 
+-static void *
+-udev_monitor_thread(void *args)
+-{
+-	struct udev_monitor *um = args;
+-	char ev[1024], syspath[DEV_PATH_MAX];
+-	struct pollfd fds[2];
+-	nfds_t nfds;
+-	ssize_t len;
+-	int devd_fd = -1, ret, action, timeout;
+-	sigset_t set;
+-	const static struct sockaddr_un sa = {
+-		.sun_family = AF_UNIX,
+-		.sun_path = DEVD_SOCK_PATH,
+-	};
+-
+-	sigfillset(&set);
+-	pthread_sigmask(SIG_BLOCK, &set, NULL);
+-
+-	fds[0].fd = um->fds[1];
+-	fds[0].events = 0;
+-	fds[1].events = POLLIN;
+-
+-	for (;;) {
+-		if (devd_fd < 0 &&
+-		    (devd_fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0)) >= 0 &&
+-		    connect(devd_fd, (struct sockaddr *) &sa, sizeof(sa)) < 0) {
+-			close(devd_fd);
+-			devd_fd = -1;
+-		}
+-
+-		if (devd_fd < 0) {
+-			nfds = 1;
+-			timeout = DEVD_RECONNECT_INTERVAL;
+-		} else {
+-			fds[1].fd = devd_fd;
+-			nfds = 2;
+-			timeout = -1;
+-		}
+-
+-		ret = poll(fds, nfds, timeout);
+-		if (ret == -1 && errno == EINTR)
+-			continue;
+-		if (ret == -1)
+-			break;
+-
+-		/* edev_monitor is finishing */
+-		if (fds[0].revents & POLLHUP)
+-			break;
+-
+-		/* connection respawn timer expired */
+-		if (ret == 0 || devd_fd < 1)
+-			continue;
+-
+-		if (fds[1].revents & POLLIN) {
+-			if ((len = recv(devd_fd, ev, sizeof(ev), MSG_WAITALL))
+-			    <= 0) {
+-				close(devd_fd);
+-				devd_fd = -1;
+-				continue;
+-			}
+-			/* Replace terminating LF with 0 to make C-string */
+-			ev[len - 1] = '\0';
+-			action = parse_devd_message(ev, syspath, sizeof(syspath));
+-			if (action != UD_ACTION_NONE &&
+-			    udev_filter_match(um->udev, &um->filters, syspath))
+-				udev_monitor_send_device(um, syspath, action);
+-		}
+-
+-		if (fds[1].revents & POLLHUP) {
+-			close(devd_fd);
+-			devd_fd = -1;
+-		}
+-	}
+-
+-	if (devd_fd >= 0)
+-		close(devd_fd);
+-
+-	return (NULL);
+-}
+-
+ LIBUDEV_EXPORT struct udev_monitor *
+ udev_monitor_new_from_netlink(struct udev *udev, const char *name)
+ {
+@@ -235,18 +145,11 @@
+ 	if (!um)
+ 		return (NULL);
+ 
+-	if (pipe2(um->fds, O_CLOEXEC) == -1) {
++	if (pipe2(um->fds, O_CLOEXEC | O_NONBLOCK) == -1) {
+ 		ERR("pipe2 failed");
+ 		free(um);
+ 		return (NULL);
+ 	}
+-	if (udev_monitor_set_fd_nonblock(um->fds[0]) == -1) {
+-		ERR("fcntl failed");
+-		close(um->fds[0]);
+-		close(um->fds[1]);
+-		free(um);
+-		return (NULL);
+-	}
+ 
+ 	um->udev = udev;
+ 	_udev_ref(udev);
+@@ -279,12 +182,19 @@
+ {
+ 
+ 	TRC("(%p)", um);
+-
+-	if (pthread_create(&um->thread, NULL, udev_monitor_thread, um) != 0) {
+-		ERR("thread_create failed");
+-		return (-1);
+-	}
+-
++	if (um->receiving)
++		return (0);
++	um->receiving = true;
++	/*
++	 * Watch the registry only if this monitor can take input devices
++	 * (modesetting's monitor asks for "drm" only). Without a registry
++	 * (no /dev/ioregistry) the fd simply never becomes readable, as
++	 * libudev-devd's did without devd; that is not an error, or libinput
++	 * would refuse to start.
++	 */
++	if (udev_filter_wants_subsystem(&um->filters, "input"))
++		um->watch = udev_iokit_watch_start(udev_monitor_iokit_event,
++		    um);
+ 	return (0);
+ }
+ 
+@@ -314,7 +224,6 @@
+ 	while (!STAILQ_EMPTY(umqh)) {
+ 		umqe = STAILQ_FIRST(umqh);
+ 		STAILQ_REMOVE_HEAD(umqh, next);
+-		udev_device_unref(umqe->ud);
+ 		free(umqe);
+ 	}
+ }
+@@ -326,8 +235,9 @@
+ 		return (NULL);
+ 	TRC("(%p) refcount=%d", um, um->refcount);
+ 	if (--um->refcount == 0) {
++		/* After this no producer call is running or will start. */
++		udev_iokit_watch_stop(um->watch);
+ 		close(um->fds[0]);
+-		pthread_join(um->thread, NULL);
+ 		close(um->fds[1]);
+ 		udev_filter_free(&um->filters);
+ 		udev_monitor_queue_drop(&um->queue);

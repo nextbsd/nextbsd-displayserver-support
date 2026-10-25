@@ -27,7 +27,7 @@ writes, this `NOTICE.md` and `README.md`.
 | `xkeyboard-config` | freedesktop.org, `xkeyboard-config/xkeyboard-config` | 2.48 | MIT/X11-style, per file (`COPYING`) |
 | `libxkbcommon` | xkbcommon, `xkbcommon/libxkbcommon` | 1.13.2 | MIT/X11-style, per file (`LICENSE`). Core only; `libxkbcommon-x11` is built by nextbsd-xlibs |
 | `epoll-shim` | Jan Kokemüller, `jiixyj/epoll-shim` | 0.0.20240608 | MIT (`LICENSE`) |
-| `libudev-devd` | Vladimir Kondratyev, `wulf7/libudev-devd` | 0.7.0 | BSD-2-Clause (in each file; no `COPYING`). The optional GPL code (`utils-gpl.c`) is not built |
+| `libudev` | NextBSD, on libudev-devd by Vladimir Kondratyev (`wulf7/libudev-devd`) | 0.7.0 + `patches/libudev` | BSD-2-Clause (in each file; no `COPYING`). NextBSD's new files (`udev-iokit.c`, `udev-iokit.h`) and changes in the patches are BSD-2-Clause too. The optional GPL code (`utils-gpl.c`) is not built. Links nextbsd-userland's libIOKit, CoreFoundation and libdispatch dynamically (their licences are recorded in nextbsd-userland) |
 | `linux-input-shim` | NextBSD (written by `build-displayserver-support.sh`) | n/a | BSD-2-Clause (this repo's `LICENSE`); each header only includes the base's BSD-2-Clause `<dev/evdev/…>` header |
 | `libevdev` | freedesktop.org, `libevdev/libevdev` | 1.14.0 | MIT (`COPYING`). The Linux UAPI headers it carries in `include/linux/linux` (GPL-2.0 WITH Linux-syscall-note) are build input only and not installed |
 | `mtdev` | Henrik Rydberg, bitmath.org | 1.1.7 | MIT (`COPYING`) |

@@ -31,9 +31,11 @@ libxkbcommon        1.13.2        acc4d5f7c3cbba5f9f8d08d8bdbeede84ecede46792f47
 # ---- the input stack (from nextbsd-xlibre), in build order ----
 # epoll-shim publishes no release tarball: a GitHub tag archive.
 epoll-shim          0.0.20240608  8f5125217e4a0eeb96ab01f9dfd56c38f85ac3e8f26ef2578e538e72e87862cb  https://github.com/jiixyj/epoll-shim/archive/refs/tags/v0.0.20240608.tar.gz
-# libudev-devd: a GitHub tag archive (no release tarball), wulf7's repo, which
-# FreeBSD's devel/libudev-devd also fetches. 0.7.0, unmodified (E23 D10).
-libudev-devd        0.7.0         a3a64de87ea1affb2485dac625c8d47714a766717315ffe0443be1f240206815  https://github.com/wulf7/libudev-devd/archive/refs/tags/v0.7.0.tar.gz
+# libudev: NextBSD's IOKit libudev is libudev-devd 0.7.0 with its input device
+# source and monitor replaced (patches/libudev, nextbsd-displayserver-support#2).
+# The base is a GitHub tag archive (no release tarball) of wulf7's repo, which
+# FreeBSD's devel/libudev-devd also fetches.
+libudev             0.7.0         a3a64de87ea1affb2485dac625c8d47714a766717315ffe0443be1f240206815  https://github.com/wulf7/libudev-devd/archive/refs/tags/v0.7.0.tar.gz
 libevdev            1.14.0        5a0966c7110648665983848bad696c7acba614a2160d2865d535397101007332  https://www.freedesktop.org/software/libevdev/libevdev-1.14.0.tar.xz
 mtdev               1.1.7         a107adad2101fecac54ac7f9f0e0a0dd155d954193da55c2340c97f2ff1d814e  https://bitmath.org/code/mtdev/mtdev-1.1.7.tar.bz2
 # libinput publishes its releases as GitLab tag archives.

@@ -8,8 +8,8 @@
 # the GNUstep WindowServer and XLibre) for ONE architecture, from pinned
 # upstream release tarballs, into /usr (E25 D4) with upstream sonames: libdrm,
 # pixman, expat, freetype, fontconfig, xkeyboard-config, libxkbcommon (core),
-# epoll-shim, libudev-devd, the <linux/input.h> shim, libevdev, mtdev and
-# libinput. None of them links an X library or libwayland (E25 D2).
+# epoll-shim, libudev (NextBSD's IOKit libudev), the <linux/input.h> shim,
+# libevdev, mtdev and libinput. None of them links an X library or libwayland (E25 D2).
 #
 # For each component, in COMPONENTS order:
 #   1. fetch:   download the tarball named in sources.lock, refuse it unless
@@ -26,8 +26,10 @@
 #
 # Upstream build systems are used as they are, with NextBSD's options; nothing
 # is rewritten as a hand-made makefile. Nothing here uses FreeBSD packages, the
-# ports tree or ports tools, and nothing links against nextbsd-userland: the
-# NextBSD base (compat) sysroot is the only input besides sources.lock.
+# ports tree or ports tools. Besides sources.lock the inputs are the NextBSD
+# base (compat) and nextbsd-userland's artifact on top of it, of which only
+# libudev uses anything: libIOKit, CoreFoundation and libdispatch in
+# /usr/lib/system, and their headers.
 #
 # Install layout (E25 D4; README "Paths"):
 #   /usr/lib, /usr/include, /usr/bin, /usr/libexec/libinput   libraries, headers, tools
@@ -43,7 +45,8 @@
 # EXECUTION CONTEXT (set up by CI before this runs)
 #   Inside the nextbsd-kernel-toolchain container (pinned clang/lld 19.1.7 in
 #   $CROSS_BINDIR, meson, ninja, cmake, pkgconf, autotools, python3, perl,
-#   bison), with compat's `continuous` base extracted into $SYSROOT. $SYSROOT
+#   bison), with compat's `continuous` base and then nextbsd-userland's
+#   `continuous` artifact extracted into $SYSROOT. $SYSROOT
 #   is scratch: this script installs every component into it as it goes.
 #
 # USAGE
@@ -345,10 +348,10 @@ cmake_build() {
 }
 
 # The base's own files, listed while the sysroot is still the pristine compat
-# base (libdrm's xf86drm.h, the first component's header, is the marker), so
-# stage can refuse a component that would overwrite one. A later partial run
-# reuses the list. The sysroot must be compat's base alone: nothing here may
-# build against nextbsd-xlibs or anything else in /usr/X11.
+# base plus nextbsd-userland (libdrm's xf86drm.h, the first component's
+# header, is the marker), so stage can refuse a component that would
+# overwrite one. A later partial run reuses the list. Nothing here may build
+# against nextbsd-xlibs or anything else in /usr/X11.
 base_list() {
     BASE_LIST="$BUILD/base-files-$T.list"
     mkdir -p "$BUILD"
@@ -788,29 +791,129 @@ build_epoll_shim() {
     pc_check epoll-shim-interpose
 }
 
-# libudev-devd 0.7.0 — the libudev API on NextBSD's devfs, sysctl and devinfo:
-# libinput enumerates input devices through it. Unmodified (E23 D10). meson.
-# libudev.so.0 is the soname the IOKit libudev that replaces it keeps (E25 D7,
-# nextbsd-displayserver-support#2).
+# libudev — NextBSD's IOKit libudev (E25 D7, nextbsd-displayserver-support#2):
+# libudev-devd 0.7.0 (BSD-2-Clause) with its input device source and monitor
+# replaced (patches/libudev, Origin: NextBSD). meson. libinput and the X
+# server enumerate input devices and follow hotplug through it.
 #
-# It finds /dev/input/event*, /dev/kbdmux*, /dev/sysmouse and the rest once,
-# when the caller enumerates. Its udev_monitor (hotplug) listens on devd's
-# socket, and NextBSD has no devd, so devices that appear later are not seen:
-# hotplug comes with the IOKit libudev. The GPL code (enable-gpl) stays off.
-# Upstream's default is werror=true; clang 19 adds warnings 0.7.0 predates, so
-# -Werror is off (as FreeBSD's port does). Links the base's libdevinfo and
-# libprocstat.
-build_libudev_devd() {
-    comp "libudev-devd [meson cross]"
-    fresh_dirs libudev-devd
-    fetch libudev-devd
-    meson_build -Dwerror=false -Denable-gpl=false
-    stage libudev-devd
-    test -f "$DESTDIR$PREFIX/include/libudev.h" || fail "libudev.h not staged"
+#   enumerate  IOServiceGetMatchingServices(IOServiceMatching("IOHIDDevice")):
+#              one registry entry per /dev/input/eventN (nextbsd-kernel#331);
+#              everything else (/dev/dri/card*, ...) is still found in devfs,
+#              as libudev-devd did
+#   properties DEVNAME, MAJOR/MINOR/devnum, ID_INPUT + ID_INPUT_* (from
+#              PrimaryUsagePage/PrimaryUsage), ID_VENDOR_ID, ID_MODEL_ID,
+#              ID_INTEGRATION, and a parent with NAME, PRODUCT and UNIQ, from
+#              the entry's keys; the kern.evdev.input sysctls only as fallback
+#   monitor    IOServiceAddMatchingNotification (first-match + terminated) on
+#              a private dispatch queue, which writes to a pipe whose read end
+#              is the pollable monitor fd; no devd socket
+#
+# Same soname (libudev.so.0), header and libudev.pc (the udev 243 API level
+# libudev-devd claims) as before, so nothing that links it changes. It links
+# libIOKit, CoreFoundation and libdispatch from nextbsd-userland, in
+# /usr/lib/system (found at run time through ldconfig's /usr/lib/system
+# entry; no RPATH); -L for them goes in c_link_args, so neither the .pc file
+# nor the library names the build sysroot. The GPL code (enable-gpl) stays
+# off; -Werror is off as before (clang 19 warns where 0.7.0 predates it).
+build_libudev() {
+    comp "libudev (IOKit) [meson cross]"
+    fresh_dirs libudev
+    fetch libudev
+    meson_build -Dwerror=false -Denable-gpl=false \
+        -Dc_link_args="-L$SYSROOT/usr/lib/system"
+    stage libudev
+    local x="$DESTDIR$PREFIX" lib
+    lib="$x/lib/libudev.so.0"
+    test -f "$x/include/libudev.h" || fail "libudev.h not staged"
     so_check libudev.so.0
-    lib_needs libudev.so.0 libdevinfo.so libprocstat.so
-    # libudev-devd's .pc claims udev 243's API level; libinput asks for none.
+    # (userland's libdispatch has an unversioned soname, libsystem_dispatch.so.)
+    lib_needs libudev.so.0 libIOKit.so.1 libCoreFoundation.so.6 libsystem_dispatch.so \
+        libdevinfo.so libprocstat.so
+    # The IOKit device source and monitor are what was compiled, and the
+    # devd monitor is gone.
+    names_path "$lib" IOHIDDevice org.nextbsd.DevNode
+    if grep -q -a -F devd.seqpacket.pipe "$lib"; then
+        fail "libudev.so.0 still opens devd's socket (patches/libudev not built in?)"
+    fi
+    note "no devd socket in libudev.so.0"
+    # The .pc keeps libudev-devd's udev 243 API level; libinput asks for none.
     pc_check libudev 243
+    libudev_consumer_check
+}
+
+# libudev_consumer_check: a program that calls the libudev functions
+# libinput 1.32 (udev and path backends), XLibre's config/udev.c and its
+# modesetting driver use builds with nothing but
+# `pkgconf --cflags --libs libudev`, and links libudev.so.0 with no RPATH.
+# lld resolves each call against the staged library, so a missing export
+# fails here. Nothing is run (cross build).
+libudev_consumer_check() {
+    local t="$BUILD/libudev-consumer-$T" flags
+    mkdir -p "$t"
+    cat > "$t/consumer.c" <<'CEOF'
+#include <sys/types.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <libudev.h>
+
+int
+main(void)
+{
+	struct udev *u = udev_new();
+	struct udev_monitor *m = udev_monitor_new_from_netlink(u, "udev");
+	struct udev_enumerate *e = udev_enumerate_new(u);
+	struct udev_list_entry *l;
+	struct udev_device *d, *p;
+
+	udev_monitor_filter_add_match_subsystem_devtype(m, "input", NULL);
+	udev_monitor_filter_add_match_tag(m, "seat0");
+	udev_monitor_enable_receiving(m);
+	udev_enumerate_add_match_subsystem(e, "input");
+	udev_enumerate_add_match_sysname(e, "event[0-9]*");
+	udev_enumerate_add_match_tag(e, "seat0");
+	udev_enumerate_scan_devices(e);
+	udev_list_entry_foreach(l, udev_enumerate_get_list_entry(e)) {
+		d = udev_device_new_from_syspath(udev_enumerate_get_udev(e),
+		    udev_list_entry_get_name(l));
+		if (d == NULL)
+			continue;
+		p = udev_device_get_parent(d);
+		(void)udev_device_get_parent_with_subsystem_devtype(d, "input",
+		    NULL);
+		printf("%s %s %s %s %s %d %ju %s %s %s\n",
+		    udev_device_get_syspath(d), udev_device_get_sysname(d),
+		    udev_device_get_devnode(d), udev_device_get_subsystem(d),
+		    udev_device_get_action(d),
+		    udev_device_get_is_initialized(d),
+		    (uintmax_t)udev_device_get_devnum(d),
+		    udev_device_get_property_value(d, "ID_INPUT"),
+		    p != NULL ? udev_device_get_sysattr_value(p, "name") : "",
+		    udev_list_entry_get_value(
+		    udev_device_get_properties_list_entry(d)));
+		(void)udev_device_get_udev(d);
+		udev_device_unref(udev_device_ref(d));
+	}
+	d = udev_device_new_from_devnum(u, 'c', 0);
+	udev_device_unref(d);
+	d = udev_monitor_receive_device(m);
+	udev_device_unref(d);
+	(void)udev_monitor_get_fd(m);
+	(void)udev_monitor_get_udev(m);
+	udev_enumerate_unref(e);
+	udev_monitor_unref(m);
+	udev_unref(udev_ref(u));
+	return (0);
+}
+CEOF
+    flags=$(pkgconf --cflags --libs libudev) || fail "pkgconf --cflags --libs libudev"
+    "$CROSS_BINDIR/clang" --target="$CROSS_TRIPLE" --sysroot="$SYSROOT" -fuse-ld=lld \
+        -o "$t/consumer" "$t/consumer.c" $flags \
+        || fail "a libudev consumer does not build with pkgconf --cflags --libs libudev ($flags)"
+    needed_check "$t/consumer" libudev.so.0
+    if "$READELF" -d "$t/consumer" | grep -E '\((RPATH|RUNPATH)\)'; then
+        fail "the libudev consumer got an RPATH/RUNPATH"
+    fi
+    note "consumer builds with pkgconf --cflags --libs libudev: '$(echo $flags | sed "s#$SYSROOT##g")'"
 }
 
 # linux-input-shim — <linux/input.h>, <linux/input-event-codes.h> and
@@ -993,9 +1096,9 @@ build_libinput() {
 # Whole-artifact checks
 # =============================================================================
 # Every ELF object in the artifact links only the NextBSD base and this repo
-# (each DT_NEEDED is in the sysroot's /lib or /usr/lib, which holds nothing
-# else), so the sysroot needs nothing but compat's base; and none links an X
-# library, libwayland (E25 D2) or D-Bus.
+# (each DT_NEEDED is in the sysroot's /lib or /usr/lib), except libudev, which
+# also links nextbsd-userland's /usr/lib/system (libIOKit, CoreFoundation,
+# libdispatch); and none links an X library, libwayland (E25 D2) or D-Bus.
 artifact_checks() {
     comp "artifact checks"
     local f n lib count=0
@@ -1005,12 +1108,19 @@ artifact_checks() {
             case "$lib" in
                 libX*|libxcb*|libwayland*|libdbus*) fail "${f#"$DESTDIR"} links $lib" ;;
             esac
-            [ -e "$SYSROOT/lib/$lib" ] || [ -e "$SYSROOT/usr/lib/$lib" ] \
-                || fail "${f#"$DESTDIR"} links $lib, which neither the NextBSD base nor this repo has"
+            if [ -e "$SYSROOT/lib/$lib" ] || [ -e "$SYSROOT/usr/lib/$lib" ]; then
+                continue
+            fi
+            [ -e "$SYSROOT/usr/lib/system/$lib" ] \
+                || fail "${f#"$DESTDIR"} links $lib, which neither the NextBSD base, nextbsd-userland nor this repo has"
+            case "${f#"$DESTDIR"}" in
+                "$PREFIX"/lib/libudev.so.*) ;;
+                *) fail "${f#"$DESTDIR"} links nextbsd-userland's $lib (only libudev may)" ;;
+            esac
         done < <("$READELF" -d "$f" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p')
         count=$((count + 1))
     done < <(find "$DESTDIR" -type f)
-    note "$count ELF objects link only the base and this repo; no X, Wayland or D-Bus"
+    note "$count ELF objects link only the base and this repo (libudev also /usr/lib/system); no X, Wayland or D-Bus"
     [ ! -e "$DESTDIR$SYSCONFDIR" ] || fail "$SYSCONFDIR is in the artifact"
     [ ! -e "$DESTDIR$X_PREFIX" ] || fail "$X_PREFIX is in the artifact"
     [ ! -e "$DESTDIR$PREFIX/include/linux" ] || fail "$PREFIX/include/linux is in the artifact"
@@ -1033,7 +1143,7 @@ COMPONENTS="
     libxkbcommon
     xkeyboard-config
     epoll-shim
-    libudev-devd
+    libudev
     linux-input-shim
     libevdev
     mtdev
