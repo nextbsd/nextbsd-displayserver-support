@@ -78,7 +78,7 @@ Nothing upstream is committed. `build-displayserver-support.sh` downloads into
 
 ## Build model
 
-`build-displayserver-support.sh` runs inside the `nextbsd-kernel-toolchain`
+`build-displayserver-support.sh` runs inside the `nextbsd-toolchain`
 container (the pinned clang/lld 19.1.7, meson, ninja, cmake, pkgconf,
 autotools, python3, perl and bison) with compat's `continuous` base and then
 nextbsd-userland's `continuous` artifact extracted as the sysroot. It needs:

@@ -3,7 +3,7 @@ name: Build NextBSD displayserver-support (libraries shared by the display serve
 # Cross-builds the libraries and data both display servers share (E25: libdrm,
 # pixman, expat, freetype, fontconfig, xkeyboard-config, libxkbcommon and the
 # input stack) into /usr for amd64 and arm64 on the x86_64 runner, inside the
-# per-arch nextbsd-kernel-toolchain container, against compat's `continuous`
+# per-arch nextbsd-toolchain container, against compat's `continuous`
 # base with nextbsd-userland's `continuous` artifact on top (libIOKit for the
 # IOKit libudev) as the sysroot, from the pinned tarballs in sources.lock. Publishes
 # nextbsd-displayserver-support-<arch>.tar.gz to this repo's `continuous`
@@ -44,7 +44,7 @@ jobs:
       # binutils at $CROSS_BINDIR (set by the image), plus meson, ninja, cmake,
       # pkgconf, autotools, python3, perl and bison (nextbsd-toolchain#13).
       # Nothing is apt-installed here.
-      image: ghcr.io/nextbsd/nextbsd-kernel-toolchain:${{ matrix.arch }}-${{ inputs.fbsd_sha && format('fbsd-{0}', inputs.fbsd_sha) || 'latest' }}
+      image: ghcr.io/nextbsd/nextbsd-toolchain:${{ matrix.arch }}-${{ inputs.fbsd_sha && format('fbsd-{0}', inputs.fbsd_sha) || 'latest' }}
     steps:
       - uses: actions/checkout@v4
 
