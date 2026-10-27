@@ -21,7 +21,7 @@ Description: Give a render node to the DRM device that owns it
  "id -= 128" and BUG comment) now uses the same lookup through
  get_sysctl_busid().
 Origin: NextBSD (nextbsd/nextbsd-xlibs#2; the defect is in E23 audit 1,
- section 6, and nextbsd-kernel-extensions#66)
+ section 6, and nextbsd-kernel-extensions-graphics#66)
 Forwarded: no
 ---
 diff --git a/xf86drm.c b/xf86drm.c
